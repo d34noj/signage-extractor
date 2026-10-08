@@ -30,7 +30,7 @@ if uploaded_file is not None:
                         df_table = pd.DataFrame(table)
                         header_text = " ".join([str(cell) for row in df_table.head(2).values for cell in row if cell])
                         # Filter for signage-related schedule tables
-                        if any(keyword in header_text.upper() for keyword in ["TK CODE", "SIGNAGE", "FAMILY", "SCHEDULE"]):
+                        if any(keyword in header_text.upper() for keyword in ["TK CODE", "SIGNAGE", "FAMILY", "SCHEDULE", "SIGNAGE REFERENCE"]):
                             signage_tables.append((page_num + 1, df_table))
                 
                 # 2. Backup text code search
@@ -43,27 +43,34 @@ if uploaded_file is not None:
         if signage_tables:
             st.success(f"Successfully extracted schedule table(s) from PDF!")
             
-            # Combine and clean tables
+            # Combine and clean tables safely
             master_df_list = []
             for page_num, df in signage_tables:
                 if len(df) > 1:
-                    # Clean headers
-                    df.columns = [str(c).strip() for c in df.iloc[0]]
-                    df_clean = df[1:].reset_index(drop=True)
+                    # Clean and ensure unique column headers to prevent InvalidIndexError
+                    raw_headers = [str(c).strip() if c is not None and str(c).strip() != "" else f"Col_{i}" for i, c in enumerate(df.iloc[0])]
+                    
+                    # Make headers unique
+                    cols = pd.Series(raw_headers)
+                    for dup in cols[cols.duplicated()].unique():
+                        cols[cols == dup] = [f"{dup}_{i}" if i != 0 else dup for i in range(sum(cols == dup))]
+                    
+                    df_clean = df[1:].copy()
+                    df_clean.columns = cols
+                    df_clean = df_clean.reset_index(drop=True)
                     df_clean["Source Page"] = page_num
                     master_df_list.append(df_clean)
             
             if master_df_list:
-                master_df = pd.concat(master_df_list, ignore_index=True)
+                # Concatenate safely filling missing columns with NaN
+                master_df = pd.concat(master_df_list, ignore_index=True, join='outer')
                 
-                # Clean up column names if needed (standardize Level and Count)
-                # Look for columns resembling Level and Count
+                # Find Level and Count columns dynamically
                 cols = master_df.columns
                 level_col = next((c for c in cols if 'level' in c.lower()), None)
-                count_col = next((c for c in cols if 'count' in c.lower() or 'qty' in c.lower()), None)
+                count_col = next((c for c in cols if 'count' in c.lower() or 'qty' in c.lower() or 'quantity' in c.lower()), None)
                 
                 if count_col:
-                    # Convert count to numeric for calculations
                     master_df[count_col] = pd.to_numeric(master_df[count_col], errors='coerce').fillna(0)
 
                 st.markdown("---")
@@ -75,8 +82,8 @@ if uploaded_file is not None:
                     total_items = int(master_df[count_col].sum()) if count_col else len(master_df)
                     st.metric("Total Signage Quantity", total_items)
                 with col2:
-                    unique_codes = master_df.iloc[:, 2].nunique() if len(master_df.columns) > 2 else len(master_df)
-                    st.metric("Unique Signage Codes", unique_codes)
+                    unique_codes = master_df.iloc[:, 0].nunique() if len(master_df.columns) > 0 else len(master_df)
+                    st.metric("Unique Signage Entries", unique_codes)
                 with col3:
                     levels_count = master_df[level_col].nunique() if level_col else 1
                     st.metric("Levels Covered", levels_count)
@@ -98,7 +105,7 @@ if uploaded_file is not None:
 
                 st.dataframe(filtered_df, use_container_width=True)
 
-                # Export full or filtered CSV
+                # Export CSV
                 csv_data = filtered_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label=f"📥 Download Schedule for [{selected_level}] as CSV",
@@ -107,7 +114,7 @@ if uploaded_file is not None:
                     mime="text/csv"
                 )
                 
-                # Quantity Breakdown by Level if Level Column exists
+                # Quantity Breakdown by Level
                 if level_col and count_col:
                     st.markdown("---")
                     st.header("📊 Quantity Breakdown by Level")
