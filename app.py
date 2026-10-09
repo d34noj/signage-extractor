@@ -3,6 +3,12 @@ Store Signage Schedule Extractor
 --------------------------------
 Run:   streamlit run signage_extractor.py
 Needs: pip install streamlit pdfplumber pandas openpyxl pillow reportlab anthropic
+       (pypdfium2 comes with pdfplumber)
+
+Two modes, switched at the top of the page:
+  TK Maxx - schedule extractor (below).
+  M&S     - sign register built from the Geetee sign manual: one row / one page per sign sheet, with
+            qty, height, spec, flags and a position snippet cut from M&S's own elevation or plan.
 
 How it works
   1. SCHEDULE   - reads the text of the TK_Signage schedule page (NOT table extraction,
@@ -442,11 +448,647 @@ def build_pdf(df, snips, source_name="", summary=True) -> bytes:
 
 
 # --------------------------------------------------------------------------------------
+# M&S (Geetee sign manual) - one sheet per sign
+#   The M&S pack is not a schedule. It is a manual: one A3 sheet per sign with the title block,
+#   spec callouts, "N No. required", and the position cut from M&S's elevation/plan.
+#   So this tab builds a REGISTER from the sheets (one row per sheet) + a position snippet.
+#   Text is read with pypdfium2 (fast on big vector drawings); nothing is guessed.
+# --------------------------------------------------------------------------------------
+MS_TB_RECT = (0.40, 0.0, 1.0, 0.125)  # title block, fractions of page (x0, y0 from bottom, x1, y1)
+
+SPEC_RE = re.compile(r"acrylic|vinyl|alumin|\bLED\b|\bRAL\b|Mactac|\b3M\b|foamex|returns?\b|coil|fixings?|"
+                     r"bracket|catenary|screw|sleeve|baseplate|slats?|laminated|digitally|CAD cut|stud|"
+                     r"sanding|Signfix|box section|backing|carcass|plinth|gusset", re.I)
+BOILER_RE = re.compile(r"property of Geetee|reproduced|permission|All measurements|REV DATE|DESCRIPTION:|"
+                       r"CLIENT:|PROJECT:|ITEM REF|DRAWING NUMBER|JOB NO|DRAWN BY|Geeteesigns|^SCALE|^DATE", re.I)
+CAPTION_RE = re.compile(r"elevation|position|\bplan\b|floor|lounge|corridor|fashion|foodhall|food hall", re.I)
+FLAG_RE = re.compile(r"\bTBC\b|ON HOLD|re-?utilised|by others|to be removed|to be re-?used", re.I)
+QTY_RE = re.compile(r"(\d+)\s*No\.", re.I)
+KIND_REF_RE = re.compile(r"\bplan\b|elevations?\b|\bpositions\b", re.I)
+
+
+def ms_region(page, tp, x0, y0, x1, y1):
+    W, H = page.get_size()
+    return tp.get_text_bounded(left=x0 * W, bottom=y0 * H, right=x1 * W, top=y1 * H)
+
+
+def ms_lines(s):
+    return [l.strip() for l in s.replace("\r", "\n").split("\n") if l.strip()]
+
+
+def ms_parse_rev(rev_text):
+    """Revision table text comes out scrambled, so only trust counts, letters and dates."""
+    real, notes, letters = [], [], []
+    for ln in ms_lines(rev_text):
+        m = re.match(r"^(?:([A-F])\s+)?(\d\d\.\d\d\.\d\d)\s+([A-Z]{2})\b\s*(.*)$", ln)
+        if m:
+            letter, date, by, tail = m.groups()
+            if date != "00.00.25" and by != "XX":
+                real.append(date)
+                if letter:
+                    letters.append(letter)
+                if tail.strip():
+                    notes.append(tail.strip())
+            continue
+        if BOILER_RE.search(ln) or re.fullmatch(r"[A-F]", ln) or "XXXXXX" in ln or "easuees" in ln \
+                or ln.startswith(("permission", "REV")):
+            continue
+        if not re.match(r"^\d\d\.\d\d\.\d\d", ln) and len(ln) > 3:
+            notes.append(ln)
+    letter = ""
+    if real:
+        by_count = chr(ord("A") + len(real) - 1)
+        letter = max([by_count] + letters)
+    def key(d):
+        dd, mm, yy = d.split(".")
+        return (yy, mm, dd)
+    latest = max(real, key=key) if real else ""
+    return letter, latest, notes
+
+
+def ms_image_boxes(page, max_depth=5):
+    """Embedded pictures (the M&S elevation / plan renders) as fractions of the page, top-origin."""
+    import pypdfium2.raw as pr
+    W, H = page.get_size()
+    boxes = []
+    try:
+        for o in page.get_objects(filter=[pr.FPDF_PAGEOBJ_IMAGE], max_depth=max_depth):
+            l, b, r, t = o.get_bounds()
+            if (r - l) * (t - b) / (W * H) < 0.02:
+                continue
+            if l > 0.84 * W and b < 0.14 * H:  # logo / title block
+                continue
+            bx = (max(0.0, l / W), max(0.0, 1 - t / H), min(1.0, r / W), min(1.0, 1 - b / H))
+            if bx[2] - bx[0] < 0.03 or bx[3] - bx[1] < 0.03:  # masks / clipped junk
+                continue
+            boxes.append(bx)
+    except Exception:
+        pass
+    return boxes
+
+
+def ms_default_rect(boxes):
+    """Default position crop = the lowest band of pictures (position views sit under the artwork)."""
+    if not boxes:
+        return (0.0, 0.0, 1.0, 0.885)
+    low = max(b[3] for b in boxes)
+    band = [b for b in boxes if b[3] >= low - 0.08]
+    x0 = min(b[0] for b in band) - 0.01
+    y0 = min(b[1] for b in band) - 0.015
+    x1 = max(b[2] for b in band) + 0.01
+    y1 = max(b[3] for b in band) + 0.03
+    return (max(0.0, x0), max(0.0, y0), min(1.0, x1), min(0.885, y1))
+
+
+def ms_read_page(page, n):
+    tp = page.get_textpage()
+    full = tp.get_text_bounded().replace("\r", "\n")
+    body = ms_region(page, tp, 0, MS_TB_RECT[3], 1, 1) + "\n" + ms_region(page, tp, 0, 0, MS_TB_RECT[0], MS_TB_RECT[3])
+    info = {"page": n, "drawing_no": "", "job_no": "", "description": "", "date": "", "scale": "",
+            "rev": "", "rev_date": "", "rev_notes": "", "tb_raw": ""}
+    mnum = re.search(r"(DJ-\d{4}-\d{3})\s+(\d{4,6})", full)
+    if not mnum:
+        t = full.strip()
+        info["kind"] = "Cover" if len(t) > 120 else "Section divider"
+        info["section_title"] = " ".join(ms_lines(t))[:60] if info["kind"] == "Section divider" else ""
+        info.update({"qty_lines": [], "qty_values": [], "spec": [], "captions": [], "flags": [], "heights": [],
+                     "dims": "", "illum": "", "boxes": [], "rect": (0, 0, 1, 0.885)})
+        return info
+    info["drawing_no"], info["job_no"] = mnum.groups()
+
+    desc_raw = ms_region(page, tp, 0.415, 0.02, 0.57, 0.095)
+    ls = ms_lines(desc_raw)
+    if "M&S Dundrum" in ls:
+        info["description"] = " ".join(ls[ls.index("M&S Dundrum") + 1:]).strip()
+    else:
+        info["description"] = " ".join(l for l in ls if not BOILER_RE.search(l))[:80]
+    tb = ms_region(page, tp, 0.57, 0.02, 0.72, 0.095)
+    m = re.search(r"(\d\d\.\d\d\.\d\d)\s+n/a", tb)
+    info["date"] = m.group(1) if m else ""
+    m = re.search(r"(\S+)\s*@A3", tb)
+    info["scale"] = (m.group(1) + " @A3") if m else ""
+    rev_text = ms_region(page, tp, 0.715, 0.01, 0.90, 0.12)
+    letter, latest, notes = ms_parse_rev(rev_text)
+    info["rev"], info["rev_date"], info["rev_notes"] = letter, latest, " | ".join(dict.fromkeys(notes))
+    info["tb_raw"] = desc_raw.replace("\r", " ")[:200]
+
+    body_lines = [l for l in ms_lines(body) if not BOILER_RE.search(l)]
+
+    # quantities
+    qty_lines, qty_values = [], []
+    for l in body_lines:
+        if not l.startswith("("):  # "(1 No. each floor)" only explains a total already stated
+            for mm in QTY_RE.finditer(l):
+                qty_values.append(int(mm.group(1)))
+        if QTY_RE.search(l) and "XXXXXX" not in l and "DJ" not in l.split():
+            qty_lines.append(l)
+    qty_lines = list(dict.fromkeys(qty_lines))
+    info["qty_lines"], info["qty_values"] = qty_lines, qty_values
+
+    # heights / FFL
+    blob = " ".join(body_lines)
+    heights = []
+    for mm in re.finditer(r"(\d[\d,\.]*)\s*(?:mm)?\s*(AFFL|FFL)\b([^|]{0,32})", blob, re.I):
+        val = mm.group(1)
+        tail = mm.group(3).strip()
+        tail = tail if re.match(r"^(to|from)\b", tail, re.I) else ""
+        if re.fullmatch(r"\d\.\d{3}", val):  # datum like "FFL 3.144 m"
+            continue
+        heights.append(f"{val} {mm.group(2).upper()} {tail}".strip())
+    for mm in re.finditer(r"\b(AFFL|FFL)\s+(\d{3,4})\b", blob):
+        heights.append(f"{mm.group(2)} {mm.group(1)}")
+    info["heights"] = list(dict.fromkeys(heights))[:4]
+
+    nums = []
+    for l in body_lines:
+        if re.fullmatch(r"\d{2,4}", l) and int(l) >= 50 and l not in nums:
+            nums.append(l)
+    info["dims"] = ", ".join(nums[:12])
+
+    spec = []
+    for l in body_lines:
+        if SPEC_RE.search(l) and len(l) > 8 and not re.match(r"^Scale", l) and "No." not in l:
+            spec.append(l)
+    info["spec"] = list(dict.fromkeys(spec))[:10]
+    info["illum"] = "Illuminated (LED)" if re.search(r"\bLED\b", blob) else ("Non-illuminated" if info["spec"] else "")
+    info["captions"] = list(dict.fromkeys(l for l in body_lines if CAPTION_RE.search(l) and len(l) < 70))[:6]
+    info["flags"] = list(dict.fromkeys(l for l in body_lines if FLAG_RE.search(l)))[:5]
+
+    desc = info["description"]
+    info["kind"] = "Reference (plan / elevation)" if KIND_REF_RE.search(desc) and not re.search(r"vinyls?\b", desc, re.I) \
+        else "Sign sheet"
+    info["boxes"] = ms_image_boxes(page)
+    info["rect"] = ms_default_rect(info["boxes"])
+    return info
+
+
+def _ms_analyse(pdf_bytes):
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    pages, section = [], ""
+    for i in range(len(pdf)):
+        info = ms_read_page(pdf[i], i + 1)
+        if info["kind"] == "Section divider":
+            section = info["section_title"]
+        elif info["kind"] == "Cover":
+            section = ""
+        info["section"] = section
+        pages.append(info)
+    # sheet x of y per drawing number
+    by_no = defaultdict(list)
+    for p in pages:
+        if p["drawing_no"]:
+            by_no[p["drawing_no"]].append(p["page"])
+    for p in pages:
+        lst = by_no.get(p["drawing_no"], [])
+        p["sheet_of"] = f"{lst.index(p['page']) + 1} of {len(lst)}" if lst else ""
+        p["same_drawing"] = [x for x in lst if x != p["page"]]
+    ref_pages = [p["page"] for p in pages if p["kind"].startswith("Reference")]
+    for p in pages:
+        p["ref_pages"] = ref_pages
+    return pages
+
+
+def ms_proposed_qty(p):
+    """Returns (qty or None, note). Never guesses: ambiguous sheets stay blank and get flagged."""
+    vals, lines = p["qty_values"], p["qty_lines"]
+    if not vals:
+        return None, "no qty on sheet - count from plan/elevation"
+    floor = [l for l in lines if re.search(r"ground floor|first floor", l, re.I)]
+    if floor:
+        fv = [int(QTY_RE.search(l).group(1)) for l in floor if QTY_RE.search(l)]
+        return sum(fv), f"summed from floor split ({' + '.join(map(str, fv))})"
+    if len(set(vals)) == 1:
+        note = ""
+        if len(vals) > 1 or any(re.search(r"sets?|each|req.d|D/S", l, re.I) for l in lines if not l.startswith("(")):
+            note = "qty is per set / per item - read the sheet"
+        return vals[0], note
+    return None, "several different qty callouts - read the sheet"
+
+
+@st.cache_data(show_spinner="Reading manual...")
+def ms_analyse(pdf_bytes):
+    return _ms_analyse(pdf_bytes)
+
+
+@st.cache_resource(show_spinner=False)
+def ms_open(digest, pdf_bytes):
+    import pypdfium2 as pdfium
+    return pdfium.PdfDocument(pdf_bytes)
+
+
+def ms_render(doc, page_no, rect, dpi, box_label=None):
+    """Render a rectangle (fractions x0,y0,x1,y1 with y measured from the TOP) of a page to PNG bytes."""
+    page = doc[page_no - 1]
+    W, H = page.get_size()
+    x0, y0, x1, y1 = rect
+    x0, y0 = max(0.0, min(x0, 0.98)), max(0.0, min(y0, 0.98))
+    x1, y1 = min(1.0, max(x1, x0 + 0.02)), min(1.0, max(y1, y0 + 0.02))
+    im = page.render(scale=dpi / 72.0, crop=(x0 * W, (1 - y1) * H, (1 - x1) * W, y0 * H)).to_pil().convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+MS_VISION_PROMPT = """This is one A3 sheet from a sign manual (drawing {dn}, "{desc}").
+Read ONLY what is drawn or written on the sheet. Do not infer or assume.
+Return JSON only with these keys:
+  "size": the sign's overall size as dimensioned, e.g. "801 x 275 mm", or null
+  "height": its mounting height as dimensioned (AFFL/FFL or a bare height dimension on the elevation) and what it is measured to, or null
+  "position": one short phrase saying where it goes (wall / area / view shown), or null
+  "qty": the quantity written on the sheet, as text, or null
+  "tbc": any TBC / on hold / by others note, or null
+  "confidence": "high", "medium" or "low"
+  "evidence": the exact dimension or note text you relied on, or null
+Use null for anything not shown."""
+
+
+def ms_vision_read(client, model, doc, p):
+    png = ms_render(doc, p["page"], (0, 0, 1, 1), 110)
+    msg = client.messages.create(
+        model=model, max_tokens=600,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": base64.b64encode(png).decode()}},
+            {"type": "text", "text": MS_VISION_PROMPT.format(dn=p["drawing_no"], desc=p["description"])}]}])
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    a, b = text.find("{"), text.rfind("}")
+    return json.loads(text[a:b + 1])
+
+
+MS_COLS = ["Done", "Page", "Section", "Drawing No", "Description", "Kind", "Rev", "Qty (final)", "Qty as drawn",
+           "Height / FFL (final)", "Dimensions seen (mm)", "Size (read)", "Illumination", "Position (captions)",
+           "Spec", "Flags", "Qty note", "Notes"]
+
+
+def ms_build_df(pages, vision):
+    rows = []
+    for p in pages:
+        if p["kind"] in ("Cover", "Section divider"):
+            continue
+        v = vision.get(p["page"], {})
+        q, qnote = ms_proposed_qty(p)
+        if q is None and v.get("qty"):
+            m = re.search(r"\d+", str(v["qty"]))
+            if m and p["kind"] == "Sign sheet":
+                q, qnote = int(m.group(0)), "qty read by Claude from sheet - check"
+        height = "; ".join(p["heights"]) or (v.get("height") or "")
+        flags = list(p["flags"])
+        if v.get("tbc"):
+            flags.append(str(v["tbc"]))
+        if p["kind"] == "Sign sheet" and not p["captions"] and not p["boxes"]:
+            flags.append("no position view on this sheet - see reference sheets")
+        if p["kind"] == "Sign sheet" and q is None:
+            flags.append("no qty on sheet")
+        rows.append({
+            "Done": False, "Page": p["page"], "Section": p["section"], "Drawing No": p["drawing_no"],
+            "Description": p["description"] + (f"  (sheet {p['sheet_of']})" if p["sheet_of"] and not p["sheet_of"].startswith("1 of 1") else ""),
+            "Kind": p["kind"], "Rev": f"{p['rev']} ({p['rev_date']})" if p["rev"] else "",
+            "Qty (final)": q if p["kind"] == "Sign sheet" else None,
+            "Qty as drawn": "; ".join(p["qty_lines"]),
+            "Height / FFL (final)": height, "Dimensions seen (mm)": p["dims"],
+            "Size (read)": v.get("size") or "", "Illumination": p["illum"],
+            "Position (captions)": "; ".join(p["captions"]) or (v.get("position") or ""),
+            "Spec": " / ".join(p["spec"][:6]), "Flags": "; ".join(dict.fromkeys(flags)),
+            "Qty note": qnote, "Notes": "",
+        })
+    return pd.DataFrame(rows, columns=MS_COLS)
+
+
+def ms_snip_png(doc, page_no, rects, dpi, default_rect):
+    return ms_render(doc, page_no, rects.get(page_no, default_rect), dpi)
+
+
+def ms_build_xlsx(df, snips) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.styles import Alignment, Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "M&S Sign Register"
+    headers = MS_COLS + ["Position snippet"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    widths = [6, 6, 20, 13, 34, 20, 12, 9, 28, 24, 22, 18, 16, 36, 48, 30, 26, 24, 50]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+    keep = []
+    for n, (_, row) in enumerate(df.iterrows(), start=2):
+        ws.append([("" if (isinstance(row[c], float) and pd.isna(row[c])) else row[c]) for c in MS_COLS])
+        for c in ws[n]:
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+        png = snips.get(int(row["Page"]))
+        if png:
+            im = Image.open(io.BytesIO(png))
+            im.thumbnail((380, 260))
+            b = io.BytesIO()
+            im.save(b, format="PNG")
+            b.seek(0)
+            keep.append(b)
+            ws.add_image(XLImage(b), f"{ws.cell(row=1, column=len(headers)).column_letter}{n}")
+            ws.row_dimensions[n].height = 200
+    ws.freeze_panes = "A2"
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def ms_build_zip(df, snips) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for _, r in df.iterrows():
+            png = snips.get(int(r["Page"]))
+            if png:
+                name = re.sub(r"[^A-Za-z0-9]+", "_", r["Description"])[:40].strip("_")
+                z.writestr(f"p{int(r['Page']):02d}_{r['Drawing No']}_{name}.png", png)
+    return out.getvalue()
+
+
+def ms_build_pdf(df, pages_by_no, snips, source_name="") -> bytes:
+    """Landscape A4 check pack: summary table, then one page per sheet with facts + position snippet."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import (Image as RLImage, PageBreak, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=19, leading=22, alignment=0, spaceAfter=2)
+    h2 = ParagraphStyle("h2", parent=ss["Normal"], fontSize=11, leading=14, spaceAfter=5, textColor=colors.HexColor("#444444"))
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontSize=7.5, leading=9)
+    cellb = ParagraphStyle("cellb", parent=cell, fontName="Helvetica-Bold")
+    fact = ParagraphStyle("fact", parent=ss["Normal"], fontSize=9, leading=11.5)
+    cap = ParagraphStyle("cap", parent=ss["Normal"], fontSize=8, leading=10, textColor=colors.grey)
+
+    def P(t, s=cell):
+        return Paragraph(escape(str(t if t is not None and not (isinstance(t, float) and pd.isna(t)) else "")), s)
+
+    page_w, page_h = landscape(A4)
+    margin = 28
+    frame_w = page_w - 2 * margin
+    img_h = page_h - 2 * margin - 150
+
+    def footer(c, d):
+        c.saveState()
+        c.setFont("Helvetica", 7.5)
+        c.setFillColor(colors.grey)
+        c.drawString(margin, 14, f"M&S sign register - {source_name}")
+        c.drawRightString(page_w - margin, 14, f"Page {d.page}")
+        c.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=margin, title="M&S sign register")
+    story = [Paragraph("M&S Sign Register", h1), Paragraph(escape(source_name), h2)]
+    head = ["Pg", "Drawing", "Description", "Qty", "Height / FFL", "Rev", "Flags"]
+    data = [[P(h, cellb) for h in head]]
+    for _, r in df.iterrows():
+        q = r["Qty (final)"]
+        data.append([P(r["Page"]), P(r["Drawing No"]), P(r["Description"]),
+                     P("" if pd.isna(q) else int(q)), P(r["Height / FFL (final)"]), P(r["Rev"]), P(r["Flags"])])
+    t = Table(data, colWidths=[24, 64, 220, 30, 150, 70, 270], repeatRows=1)
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DDDDDD")),
+                           ("GRID", (0, 0), (-1, -1), 0.4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                           ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F5F5")])]))
+    story += [t, PageBreak()]
+
+    def fit(png, mw, mh):
+        im = Image.open(io.BytesIO(png)).convert("RGB")
+        im.thumbnail((1800, 1200))  # keeps the print pack a sensible size
+        jb = io.BytesIO()
+        im.save(jb, format="JPEG", quality=85)
+        jb.seek(0)
+        w, h = im.size
+        k = min(mw / w, mh / h)
+        return RLImage(jb, width=w * k, height=h * k)
+
+    n_rows = len(df)
+    for n, (_, r) in enumerate(df.iterrows(), start=1):
+        q = r["Qty (final)"]
+        qtxt = "-" if pd.isna(q) else int(q)
+        story.append(Paragraph(f"{escape(r['Description'])} &nbsp;&nbsp;<font size=11 color='#555555'>"
+                               f"{escape(r['Drawing No'])} &nbsp;|&nbsp; p{int(r['Page'])} &nbsp;|&nbsp; Qty {qtxt}</font>", h1))
+        story.append(Paragraph(escape(f"{r['Section']}  -  {r['Kind']}  -  Rev {r['Rev'] or '-'}"), h2))
+
+        def F(label, value):
+            return Paragraph(f"<b>{label}:</b> {escape(str(value or '-'))}", fact)
+        facts = Table([[F("Height / FFL", r["Height / FFL (final)"]), F("Qty as drawn", r["Qty as drawn"])],
+                       [F("Dimensions seen", r["Dimensions seen (mm)"]), F("Illumination", r["Illumination"])],
+                       [F("Spec", r["Spec"]), F("Flags", r["Flags"] or r["Qty note"])]],
+                      colWidths=[frame_w * 0.5, frame_w * 0.5])
+        facts.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 3), ("TOPPADDING", (0, 0), (-1, -1), 0)]))
+        story += [facts, Spacer(1, 6)]
+        png = snips.get(int(r["Page"]))
+        if png:
+            story += [fit(png, frame_w, img_h - 14), Paragraph("Position snippet - M&amp;S drawing, sheet p%d" % int(r["Page"]), cap)]
+        else:
+            story.append(Paragraph("No snippet available.", fact))
+        if n < n_rows:
+            story.append(PageBreak())
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="Store Signage Schedule Extractor", page_icon="📋", layout="wide")
-    st.title("Store Signage Schedule Extractor")
+def _ms_step(d, labels):
+    try:
+        i = labels.index(st.session_state.get("ms_pick"))
+    except ValueError:
+        i = 0
+    st.session_state["ms_pick"] = labels[(i + d) % len(labels)]
+
+
+def run_ms():
+    st.caption("Upload the M&S internal signage manual (PDF). Each sheet becomes one register row with qty, "
+               "height, spec, flags and a position snippet cut from M&S's own drawing. Nothing is guessed - "
+               "blanks and flags mean the sheet doesn't say.")
+    with st.sidebar:
+        st.header("M&S snippet settings")
+        dpi = st.slider("Snippet resolution (dpi)", 100, 250, 150, 10, key="ms_dpi")
+        incl_ref = st.checkbox("Also list plan / elevation reference sheets", False, key="ms_ref")
+        st.header("Read size / height with Claude (optional)")
+        api_key = st.text_input("Anthropic API key", value=os.getenv("ANTHROPIC_API_KEY", ""), type="password", key="ms_key")
+        model = st.text_input("Model", value="claude-sonnet-5-5", key="ms_model")
+
+    up = st.file_uploader("Drag and drop the M&S manual PDF", type=["pdf"], key="ms_up")
+    if not up:
+        st.info("Waiting for a PDF.")
+        return
+    pdf_bytes = up.getvalue()
+    digest = hashlib.md5(pdf_bytes).hexdigest()
+    try:
+        pages = ms_analyse(pdf_bytes)
+        doc = ms_open(digest, pdf_bytes)
+    except Exception as e:
+        st.error(f"Couldn't read that PDF: {e}")
+        return
+    if not any(p["drawing_no"] for p in pages):
+        st.error("No Geetee title blocks found - this doesn't look like an M&S sign manual.")
+        return
+
+    vstore = st.session_state.setdefault("ms_vision", {}).setdefault(digest, {})
+    rects = st.session_state.setdefault("ms_rects", {}).setdefault(digest, {})
+    srcs = st.session_state.setdefault("ms_src", {}).setdefault(digest, {})
+    by_page = {p["page"]: p for p in pages}
+
+    def snip_args(pg):
+        src = srcs.get(pg, pg)
+        return src, tuple(rects.get(pg, by_page[src]["rect"]))
+
+    # ---- optional vision pass
+    todo = [p for p in pages if p["kind"] == "Sign sheet" and p["page"] not in vstore]
+    if st.button(f"Read size & height from sheets with Claude ({len(todo)} sheets)", disabled=not (api_key and todo)):
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+        except Exception as e:
+            st.error(f"Anthropic library problem: {e}")
+            client = None
+        if client:
+            bar = st.progress(0.0)
+            for n, p in enumerate(todo, 1):
+                try:
+                    vstore[p["page"]] = ms_vision_read(client, model, doc, p)
+                except Exception as e:
+                    vstore[p["page"]] = {"confidence": "failed", "evidence": str(e)[:120]}
+                bar.progress(n / len(todo))
+            bar.empty()
+
+    df_all = ms_build_df(pages, vstore)
+    df = df_all if incl_ref else df_all[df_all["Kind"] == "Sign sheet"].reset_index(drop=True)
+
+    signs = df_all[df_all["Kind"] == "Sign sheet"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sheets in manual", len(df_all))
+    c2.metric("Sign sheets", len(signs))
+    c3.metric("With a qty on the sheet", int(signs["Qty (final)"].notna().sum()))
+    c4.metric("Flagged", int((signs["Flags"] != "").sum()))
+
+    t1, t2, t3 = st.tabs(["Register", "Sign pages", "Debug"])
+    with t1:
+        edit_cols = ("Done", "Qty (final)", "Height / FFL (final)", "Notes")
+        edited = st.data_editor(
+            df, hide_index=True, key=f"ms_editor_{digest}_{incl_ref}_{len(vstore)}",
+            disabled=[c for c in MS_COLS if c not in edit_cols],
+            column_config={"Done": st.column_config.CheckboxColumn("Done"),
+                           "Qty (final)": st.column_config.NumberColumn("Qty (final)", min_value=0, step=1)})
+        st.caption("Qty (final), Height / FFL and Notes are yours to edit - the Excel and print pack use what you "
+                   "enter. Qty is only pre-filled when the sheet itself states it; floor splits are summed and "
+                   "flagged. Elevation dimensions are often pictures, not text, so heights are blank unless the "
+                   "sheet has AFFL / FFL as text or you run the Claude read.")
+
+        if st.button("Build Excel / ZIP / print pack from the table above"):
+            bar = st.progress(0.0, text="Cutting snippets...")
+            snips = {}
+            rows = list(edited.iterrows())
+            for n, (_, r) in enumerate(rows, 1):
+                pg = int(r["Page"])
+                src, rc = snip_args(pg)
+                snips[pg] = ms_render(doc, src, rc, dpi)
+                bar.progress(n / len(rows), text=f"Cutting snippets... {n}/{len(rows)}")
+            bar.empty()
+            st.session_state["ms_out"] = {
+                "digest": digest,
+                "xlsx": ms_build_xlsx(edited, snips),
+                "zip": ms_build_zip(edited, snips),
+                "pdf": ms_build_pdf(edited, None, snips, up.name),
+            }
+        out = st.session_state.get("ms_out")
+        if out and out["digest"] == digest:
+            d1, d2, d3, d4 = st.columns(4)
+            d1.download_button("Download CSV", edited.to_csv(index=False).encode("utf-8-sig"),
+                               "ms_sign_register.csv", "text/csv")
+            d2.download_button("Download Excel (with snippets)", out["xlsx"], "ms_sign_register.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            d3.download_button("Download all snippets (ZIP)", out["zip"], "ms_snippets.zip", "application/zip")
+            d4.download_button("Download print pack (PDF, A4 landscape)", out["pdf"], "ms_print_pack.pdf",
+                               "application/pdf")
+            st.caption("Built from the table as it was when you pressed the button - rebuild after more edits.")
+
+    with t2:
+        pool = [p for p in pages if p["kind"] == "Sign sheet" or (incl_ref and p["kind"].startswith("Reference"))]
+        labels = [f"p{p['page']} | {p['drawing_no']} | {p['description']}" for p in pool]
+        if st.session_state.get("ms_pick") not in labels:
+            st.session_state["ms_pick"] = labels[0]
+        n1, n2, n3 = st.columns([1, 1, 6])
+        n1.button("Previous", on_click=_ms_step, args=(-1, labels), key="ms_prev")
+        n2.button("Next", on_click=_ms_step, args=(1, labels), key="ms_next")
+        pick = n3.selectbox("Sheet", labels, key="ms_pick", label_visibility="collapsed")
+        p = pool[labels.index(pick)]
+        pg = p["page"]
+        row = df_all[df_all["Page"] == pg].iloc[0]
+
+        left, right = st.columns([2, 3])
+        with left:
+            st.subheader(p["description"] or "(no description)")
+            st.write(f"**{p['drawing_no']}**  |  job {p['job_no']}  |  {p['section']}  |  p{pg}"
+                     + (f"  |  sheet {p['sheet_of']}" if p["sheet_of"] else ""))
+            q = row["Qty (final)"]
+            st.write(f"**Qty:** {'-' if pd.isna(q) else int(q)}   {('(' + row['Qty note'] + ')') if row['Qty note'] else ''}")
+            if p["qty_lines"]:
+                st.write("**Qty as drawn:** " + "; ".join(p["qty_lines"]))
+            st.write(f"**Height / FFL:** {row['Height / FFL (final)'] or '-'}")
+            st.write(f"**Dimensions seen on sheet (mm):** {p['dims'] or '-'}")
+            if row["Size (read)"]:
+                st.write(f"**Size (read by Claude):** {row['Size (read)']}")
+            st.write(f"**Illumination:** {p['illum'] or '-'}")
+            st.write(f"**Rev:** {p['rev'] or '-'} {('(' + p['rev_date'] + ')') if p['rev_date'] else ''}  "
+                     f"{('- ' + p['rev_notes']) if p['rev_notes'] else ''}")
+            if p["spec"]:
+                st.write("**Spec callouts:**")
+                for l in p["spec"]:
+                    st.write("- " + l)
+            if row["Flags"]:
+                st.warning(row["Flags"])
+            if p["same_drawing"]:
+                st.caption("Other sheets for this drawing: " + ", ".join(f"p{x}" for x in p["same_drawing"]))
+        with right:
+            same_sec = [x["page"] for x in pages if x["kind"].startswith("Reference") and x["section"] == p["section"]]
+            if not p["boxes"]:
+                st.info("No picture view on this sheet. Choose a reference sheet below"
+                        + (f" - suggested for this section: {', '.join('p' + str(x) for x in same_sec)}." if same_sec else "."))
+            with st.expander("Snippet source and crop", expanded=not p["boxes"]):
+                opts = [pg] + [x for x in [y["page"] for y in pages if y["drawing_no"]] if x != pg]
+                src = st.selectbox("Take the snippet from page", opts, index=opts.index(srcs.get(pg, pg)),
+                                   format_func=lambda x: f"p{x} - {by_page[x]['description']}" + (" (this sheet)" if x == pg else ""),
+                                   key=f"ms_src_{digest}_{pg}")
+                if src == pg:
+                    srcs.pop(pg, None)
+                else:
+                    srcs[pg] = src
+                dr = by_page[src]["rect"]
+                k = f"{digest}_{pg}_{src}"
+                a, b = st.columns(2)
+                x0 = a.slider("Left %", 0, 100, int(round(dr[0] * 100)), key=f"ms_x0_{k}")
+                x1 = a.slider("Right %", 0, 100, int(round(dr[2] * 100)), key=f"ms_x1_{k}")
+                y0 = b.slider("Top %", 0, 100, int(round(dr[1] * 100)), key=f"ms_y0_{k}")
+                y1 = b.slider("Bottom %", 0, 100, int(round(dr[3] * 100)), key=f"ms_y1_{k}")
+                if x1 - x0 >= 2 and y1 - y0 >= 2:
+                    new = (x0 / 100, y0 / 100, x1 / 100, y1 / 100)
+                    if tuple(round(v, 3) for v in new) != tuple(round(v, 3) for v in dr):
+                        rects[pg] = new
+                    else:
+                        rects.pop(pg, None)
+            s_src, s_rect = snip_args(pg)
+            st.image(ms_render(doc, s_src, s_rect, 130), caption=f"Position snippet - p{s_src}")
+            with st.expander("View whole sheet"):
+                st.image(ms_render(doc, pg, (0, 0, 1, 1), 100))
+
+    with t3:
+        st.subheader("Pages")
+        st.dataframe(pd.DataFrame([{
+            "page": q["page"], "kind": q["kind"], "section": q["section"], "drawing": q["drawing_no"],
+            "description": q["description"], "rev": q["rev"], "pictures": len(q["boxes"]),
+            "qty lines": "; ".join(q["qty_lines"]), "title block text": q["tb_raw"]} for q in pages]), hide_index=True)
+        st.caption("Pictures = embedded elevation / plan renders found on the sheet (used to auto-crop the snippet).")
+
+
+
+def run_tk():
     st.caption("Upload the store fixtures / signage drawing pack (PDF). Schedule data is read from the "
                "TK_Signage schedule; position and snippets come from the plan and elevation sheets.")
 
@@ -552,6 +1194,20 @@ def main():
         st.write(res["notes"] or "None")
         st.subheader("Every code hit on the drawings")
         st.dataframe(pd.DataFrame(res["hits"]), hide_index=True)
+
+
+def main():
+    st.set_page_config(page_title="Store Signage Schedule Extractor", page_icon="📋", layout="wide")
+    st.title("Store Signage Schedule Extractor")
+    if hasattr(st, "segmented_control"):
+        mode = st.segmented_control("Store", ["TK Maxx", "M&S"], default="TK Maxx",
+                                    label_visibility="collapsed", key="store_mode") or "TK Maxx"
+    else:
+        mode = st.radio("Store", ["TK Maxx", "M&S"], horizontal=True, label_visibility="collapsed", key="store_mode")
+    if mode == "M&S":
+        run_ms()
+    else:
+        run_tk()
 
 
 if __name__ == "__main__":
