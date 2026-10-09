@@ -19,7 +19,7 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
-    with st.spinner("Extracting and cleaning signage schedule..."):
+    with st.spinner("Extracting master signage schedule..."):
         signage_tables = []
         
         with pdfplumber.open(uploaded_file) as pdf:
@@ -28,23 +28,31 @@ if uploaded_file is not None:
                 for table in tables:
                     if table:
                         df_table = pd.DataFrame(table)
-                        header_text = " ".join([str(cell) for row in df_table.head(2).values for cell in row if cell])
-                        # Only grab tables that contain the main signage schedule headers
-                        if any(keyword in header_text.upper() for keyword in ["TK CODE", "SIGNAGE", "FAMILY"]):
-                            # Exclude revision/drw/chk tables
-                            if not any(bad in header_text.lower() for bad in ["drw", "chk", "rev description"]):
+                        header_snippet = " ".join([str(cell) for row in df_table.head(3).values for cell in row if cell]).upper()
+                        
+                        # Specifically target the main TK_Signage table, ignoring B1-B6 finish schedules
+                        if "FAMILY" in header_snippet and "TK CODE" in header_snippet and "COUNT" in header_snippet:
+                            if not any(sched in header_snippet for sched in ["B1", "B2", "B3", "B4", "B5", "B6", "DUVKS"]):
                                 signage_tables.append((page_num + 1, df_table))
 
         if signage_tables:
             master_df_list = []
             for page_num, df in signage_tables:
                 if len(df) > 1:
-                    raw_headers = [str(c).strip() if c is not None and str(c).strip() != "" else f"Col_{i}" for i, c in enumerate(df.iloc[0])]
+                    # Find the actual header row dynamically
+                    header_row_idx = 0
+                    for i, row in df.iterrows():
+                        row_str = " ".join([str(c) for c in row if c is not None]).upper()
+                        if "TK CODE" in row_str or ("FAMILY" in row_str and "COUNT" in row_str):
+                            header_row_idx = i
+                            break
+                    
+                    raw_headers = [str(c).strip() if c is not None and str(c).strip() != "" else f"Col_{i}" for i, c in enumerate(df.iloc[header_row_idx])]
                     cols = pd.Series(raw_headers)
                     for dup in cols[cols.duplicated()].unique():
                         cols[cols == dup] = [f"{dup}_{i}" if i != 0 else dup for i in range(sum(cols == dup))]
                     
-                    df_clean = df[1:].copy()
+                    df_clean = df.iloc[header_row_idx + 1:].copy()
                     df_clean.columns = cols
                     df_clean = df_clean.reset_index(drop=True)
                     master_df_list.append(df_clean)
@@ -53,7 +61,7 @@ if uploaded_file is not None:
                 master_df = pd.concat(master_df_list, ignore_index=True, join='outer')
                 
                 cols_lower = {c.lower(): c for c in master_df.columns}
-                code_col = next((cols_lower[c] for c in cols_lower if 'code' in c), None)
+                code_col = next((cols_lower[c] for c in cols_lower if 'tk code' in c or 'code' in c), None)
                 level_col = next((cols_lower[c] for c in cols_lower if 'level' in c), None)
                 count_col = next((cols_lower[c] for c in cols_lower if 'count' in c or 'qty' in c or 'quantity' in c), None)
                 desc_col = next((cols_lower[c] for c in cols_lower if 'family' in c or 'type' in c or 'description' in c), None)
@@ -62,13 +70,11 @@ if uploaded_file is not None:
                 for _, row in master_df.iterrows():
                     code = str(row[code_col]).strip() if code_col and pd.notna(row[code_col]) else ""
                     
-                    # Filter out garbage rows, headers, NaNs, and revision marks
                     if code and code.upper() not in ["TK CODE", "SIGNAGE CODE", "NAN", "NONE", ""] and not code.lower().startswith("nan"):
                         level = str(row[level_col]).strip() if level_col and pd.notna(row[level_col]) else "L00"
                         count = str(row[count_col]).strip() if count_col and pd.notna(row[count_col]) else "1"
                         desc = str(row[desc_col]).strip() if desc_col and pd.notna(row[desc_col]) else ""
                         
-                        # Clean up description text if it contains nan
                         if "nan" in desc.lower():
                             desc = desc.replace("nan", "").strip("-_ ")
 
@@ -108,7 +114,7 @@ if uploaded_file is not None:
                         mime="text/csv"
                     )
                 else:
-                    st.warning("Could not isolate rows cleanly. Showing filtered table:")
+                    st.warning("Found schedule table but could not extract rows cleanly:")
                     st.dataframe(master_df, use_container_width=True)
         else:
             st.warning("No main signage schedule tables found in this PDF.")
