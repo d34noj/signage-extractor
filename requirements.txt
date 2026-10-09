@@ -1,3 +1,6 @@
 streamlit
-pdfplumber
+pdfplumber>=0.10
 pandas
+openpyxl
+pillow
+anthropic
