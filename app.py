@@ -5,52 +5,40 @@ import re
 
 # Page Configuration
 st.set_page_config(
-    page_title="Store Signage Quantity & Level Analyzer",
-    page_icon="📊",
+    page_title="Store Signage Schedule",
+    page_icon="📋",
     layout="wide"
 )
 
-st.title("Store Design Signage Schedule & Level Analyzer")
-st.markdown("Upload your store PDF drawing package to automatically extract signage schedules, sort by level, and auto-calculate total quantities.")
+st.title("Store Signage Schedule Extractor")
+st.markdown("Drag and drop your store PDF package below to instantly get a clean list of signage codes, positions, and quantities.")
 
-# File uploader
-uploaded_file = st.file_uploader("Upload Store PDF Document", type=["pdf"])
+# File uploader with built-in drag-and-drop support
+uploaded_file = st.file_uploader(
+    "Upload or Drag & Drop Store PDF Document", 
+    type=["pdf"],
+    help="Drag and drop your PDF file here, or click Browse files."
+)
 
 if uploaded_file is not None:
-    with st.spinner("Analyzing PDF pages, parsing levels, and computing totals..."):
+    with st.spinner("Extracting signage schedule..."):
         signage_tables = []
-        raw_text_matches = []
         
         with pdfplumber.open(uploaded_file) as pdf:
             for page_num, page in enumerate(pdf.pages):
-                # 1. Extract structured tables
                 tables = page.extract_tables()
                 for table in tables:
                     if table:
                         df_table = pd.DataFrame(table)
                         header_text = " ".join([str(cell) for row in df_table.head(2).values for cell in row if cell])
-                        # Filter for signage-related schedule tables
-                        if any(keyword in header_text.upper() for keyword in ["TK CODE", "SIGNAGE", "FAMILY", "SCHEDULE", "SIGNAGE REFERENCE"]):
+                        if any(keyword in header_text.upper() for keyword in ["TK CODE", "SIGNAGE", "FAMILY", "SCHEDULE"]):
                             signage_tables.append((page_num + 1, df_table))
-                
-                # 2. Backup text code search
-                text = page.extract_text()
-                if text:
-                    found_codes = re.findall(r'\b(?:TK\d{2}-\d{2}[A-Z]?|HANGNAV\d+[A-Z]?|TOV\d+[A-Z]?|HS\d+[A-Z]*|NAV\d+)\b', text)
-                    for code in found_codes:
-                        raw_text_matches.append({"Page": page_num + 1, "Signage / Reference Code": code})
 
         if signage_tables:
-            st.success(f"Successfully extracted schedule table(s) from PDF!")
-            
-            # Combine and clean tables safely
             master_df_list = []
             for page_num, df in signage_tables:
                 if len(df) > 1:
-                    # Clean and ensure unique column headers to prevent InvalidIndexError
                     raw_headers = [str(c).strip() if c is not None and str(c).strip() != "" else f"Col_{i}" for i, c in enumerate(df.iloc[0])]
-                    
-                    # Make headers unique
                     cols = pd.Series(raw_headers)
                     for dup in cols[cols.duplicated()].unique():
                         cols[cols == dup] = [f"{dup}_{i}" if i != 0 else dup for i in range(sum(cols == dup))]
@@ -58,78 +46,65 @@ if uploaded_file is not None:
                     df_clean = df[1:].copy()
                     df_clean.columns = cols
                     df_clean = df_clean.reset_index(drop=True)
-                    df_clean["Source Page"] = page_num
                     master_df_list.append(df_clean)
             
             if master_df_list:
-                # Concatenate safely filling missing columns with NaN
                 master_df = pd.concat(master_df_list, ignore_index=True, join='outer')
                 
-                # Find Level and Count columns dynamically
-                cols = master_df.columns
-                level_col = next((c for c in cols if 'level' in c.lower()), None)
-                count_col = next((c for c in cols if 'count' in c.lower() or 'qty' in c.lower() or 'quantity' in c.lower()), None)
-                
-                if count_col:
-                    master_df[count_col] = pd.to_numeric(master_df[count_col], errors='coerce').fillna(0)
+                # Identify key columns dynamically
+                cols_lower = {c.lower(): c for c in master_df.columns}
+                code_col = next((cols_lower[c] for c in cols_lower if 'code' in c), master_df.columns[2] if len(master_df.columns) > 2 else None)
+                level_col = next((cols_lower[c] for c in cols_lower if 'level' in c), master_df.columns[0] if len(master_df.columns) > 0 else None)
+                count_col = next((cols_lower[c] for c in cols_lower if 'count' in c or 'qty' in c or 'quantity' in c), master_df.columns[3] if len(master_df.columns) > 3 else None)
+                desc_col = next((cols_lower[c] for c in cols_lower if 'family' in c or 'type' in c or 'description' in c), master_df.columns[1] if len(master_df.columns) > 1 else None)
 
-                st.markdown("---")
-                st.header("📈 Project Summary & Totals")
-                
-                # Metric Cards
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    total_items = int(master_df[count_col].sum()) if count_col else len(master_df)
-                    st.metric("Total Signage Quantity", total_items)
-                with col2:
-                    unique_codes = master_df.iloc[:, 0].nunique() if len(master_df.columns) > 0 else len(master_df)
-                    st.metric("Unique Signage Entries", unique_codes)
-                with col3:
-                    levels_count = master_df[level_col].nunique() if level_col else 1
-                    st.metric("Levels Covered", levels_count)
+                simplified_data = []
+                for _, row in master_df.iterrows():
+                    code = str(row[code_col]).strip() if code_col and pd.notna(row[code_col]) else ""
+                    if code and code.upper() not in ["TK CODE", "SIGNAGE CODE", "COL_2", ""]:
+                        level = str(row[level_col]).strip() if level_col and pd.notna(row[level_col]) else "L00"
+                        count = str(row[count_col]).strip() if count_col and pd.notna(row[count_col]) else "1"
+                        desc = str(row[desc_col]).strip() if desc_col and pd.notna(row[desc_col]) else ""
+                        
+                        try:
+                            qty_val = int(float(count))
+                        except:
+                            qty_val = 1
 
-                st.markdown("---")
-                st.header("🗂️ Filter & View by Level")
+                        simplified_data.append({
+                            "Signage Code": code,
+                            "Description / Size": desc,
+                            "Position / Level": level,
+                            "Quantity": qty_val
+                        })
                 
-                if level_col:
-                    levels = ["All Levels"] + list(master_df[level_col].dropna().unique())
-                    selected_level = st.selectbox("Select Store Level", levels)
+                if simplified_data:
+                    df_simple = pd.DataFrame(simplified_data).drop_duplicates(subset=["Signage Code", "Position / Level"])
                     
-                    if selected_level != "All Levels":
-                        filtered_df = master_df[master_df[level_col] == selected_level]
-                    else:
-                        filtered_df = master_df
-                else:
-                    filtered_df = master_df
-                    selected_level = "All"
-
-                st.dataframe(filtered_df, use_container_width=True)
-
-                # Export CSV
-                csv_data = filtered_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label=f"📥 Download Schedule for [{selected_level}] as CSV",
-                    data=csv_data,
-                    file_name=f"signage_schedule_{selected_level.lower().replace(' ', '_')}.csv",
-                    mime="text/csv"
-                )
-                
-                # Quantity Breakdown by Level
-                if level_col and count_col:
+                    st.success(f"Successfully extracted {len(df_simple)} signage items!")
+                    
+                    # Totals Metric
+                    total_qty = df_simple["Quantity"].sum()
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Total Signage Quantity", total_qty)
+                    with col2:
+                        st.metric("Unique Signage Codes", len(df_simple))
+                    
                     st.markdown("---")
-                    st.header("📊 Quantity Breakdown by Level")
-                    level_summary = master_df.groupby(level_col)[count_col].sum().reset_index()
-                    level_summary.columns = ["Level", "Total Quantity"]
-                    st.dataframe(level_summary, use_container_width=True)
-
+                    st.subheader("📋 Simplified Signage List")
+                    st.dataframe(df_simple, use_container_width=True)
+                    
+                    # CSV Download
+                    csv_data = df_simple.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 Download Simplified Schedule as CSV",
+                        data=csv_data,
+                        file_name="simplified_signage_schedule.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("Could not isolate signage fields cleanly. Showing raw table:")
+                    st.dataframe(master_df, use_container_width=True)
         else:
-            st.warning("No structured signage schedule tables detected. Showing reference codes found in drawings:")
-            if raw_text_matches:
-                df_codes = pd.DataFrame(raw_text_matches).drop_duplicates().reset_index(drop=True)
-                st.dataframe(df_codes, use_container_width=True)
-                st.download_button(
-                    label="📥 Download Reference Codes CSV",
-                    data=df_codes.to_csv(index=False).encode('utf-8'),
-                    file_name="signage_reference_codes.csv",
-                    mime="text/csv"
-                )
+            st.warning("No signage schedule tables found in this PDF.")
