@@ -2,7 +2,7 @@
 Store Signage Schedule Extractor
 --------------------------------
 Run:   streamlit run signage_extractor.py
-Needs: pip install streamlit pdfplumber pandas openpyxl pillow anthropic
+Needs: pip install streamlit pdfplumber pandas openpyxl pillow reportlab anthropic
 
 How it works
   1. SCHEDULE   - reads the text of the TK_Signage schedule page (NOT table extraction,
@@ -346,6 +346,101 @@ def build_zip(snips) -> bytes:
     return out.getvalue()
 
 
+def build_pdf(df, snips, source_name="", summary=True) -> bytes:
+    """Landscape A4 print pack: optional schedule summary, then one page per sign with its snippets."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import (Image as RLImage, PageBreak, Paragraph, SimpleDocTemplate,
+                                    Spacer, Table, TableStyle)
+
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=20, leading=24, alignment=0, spaceAfter=2)
+    h2 = ParagraphStyle("h2", parent=ss["Normal"], fontSize=12, leading=15, spaceAfter=6)
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontSize=7.5, leading=9)
+    cellb = ParagraphStyle("cellb", parent=cell, fontName="Helvetica-Bold")
+    fact = ParagraphStyle("fact", parent=ss["Normal"], fontSize=9.5, leading=12)
+    cap = ParagraphStyle("cap", parent=ss["Normal"], fontSize=8, leading=10, textColor=colors.grey)
+
+    def P(text, style=cell):
+        return Paragraph(escape(str(text or "")), style)
+
+    page_w, page_h = landscape(A4)
+    margin = 28
+    frame_w = page_w - 2 * margin
+    img_area_h = page_h - 2 * margin - 135
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(margin, 14, f"Signage schedule - {source_name}")
+        canvas.drawRightString(page_w - margin, 14, f"Page {doc.page}")
+        canvas.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=margin, title="Signage schedule")
+    story = []
+
+    if summary:
+        story.append(Paragraph("Signage Schedule", h1))
+        story.append(Paragraph(escape(source_name), h2))
+        head = ["Lvl", "Code", "Description", "Size", "FFL", "Qty", "Position", "Check"]
+        data = [[P(h, cellb) for h in head]]
+        for _, r in df.iterrows():
+            data.append([P(r["Level"]), P(r["Sign Code"], cellb), P(r["Description"]),
+                         P(r["Size (drawing)"] or r["Size (name)"]), P(r["FFL"]), P(r["Qty"]),
+                         P(r["Position"]), P(r["Check"] or r["Plan check"])])
+        t = Table(data, colWidths=[28, 60, 190, 100, 112, 26, 150, 120], repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DDDDDD")),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F5F5")]),
+        ]))
+        story.append(t)
+        story.append(PageBreak())
+
+    def fit(png, max_w, max_h):
+        w, h = Image.open(io.BytesIO(png)).size
+        k = min(max_w / w, max_h / h)
+        return RLImage(io.BytesIO(png), width=w * k, height=h * k)
+
+    n_rows = len(df)
+    for n, (_, r) in enumerate(df.iterrows(), start=1):
+        story.append(Paragraph(f"{escape(r['Sign Code'])} &nbsp;&nbsp;<font size=11 color='#555555'>"
+                               f"{escape(r['Level'])} &nbsp;|&nbsp; Qty {r['Qty']}</font>", h1))
+        story.append(Paragraph(escape(r["Description"]), h2))
+        size = r["Size (drawing)"] or r["Size (name)"] or "-"
+        def F(label, value):
+            return Paragraph(f"<b>{label}:</b> {escape(str(value))}", fact)
+        facts = Table([[F("Size", size), F("FFL", r["FFL"] or "-")],
+                       [F("Position", r["Position"] or "-"), F("Check", r["Check"] or r["Plan check"])]],
+                      colWidths=[frame_w * 0.5, frame_w * 0.5])
+        facts.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 3), ("TOPPADDING", (0, 0), (-1, -1), 0)]))
+        story.append(facts)
+        story.append(Spacer(1, 8))
+
+        lst = snips.get(f"{r['Level']}|{r['Sign Code']}", [])[:2]
+        if not lst:
+            story.append(Paragraph("No plan or elevation reference found for this sign.", fact))
+        else:
+            each_w = frame_w / len(lst) - 6
+            cells = [[[fit(s["png"], each_w, img_area_h - 14), Paragraph(escape(s["label"]), cap)]
+                      for s in lst]]
+            it = Table(cells, colWidths=[frame_w / len(lst)] * len(lst))
+            it.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
+            story.append(it)
+        if n < n_rows:
+            story.append(PageBreak())
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------------------
@@ -364,6 +459,7 @@ def main():
         phw = st.slider("Plan crop half-width (pt)", 100, 600, 250, 25)
         phh = st.slider("Plan crop half-height (pt)", 100, 600, 200, 25)
         dpi = st.slider("Snippet resolution (dpi)", 100, 250, 150, 10)
+        pdf_summary = st.checkbox("Print pack: include schedule summary page(s)", True)
         st.header("Read size / FFL with Claude (optional)")
         api_key = st.text_input("Anthropic API key", value=os.getenv("ANTHROPIC_API_KEY", ""), type="password")
         model = st.text_input("Model", value="claude-sonnet-5-5")
@@ -423,7 +519,7 @@ def main():
     t1, t2, t3 = st.tabs(["Schedule", "Snippets", "Debug"])
     with t1:
         st.dataframe(df, hide_index=True)
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         d1.download_button("Download CSV", df.to_csv(index=False).encode("utf-8-sig"),
                            "signage_schedule.csv", "text/csv")
         d2.download_button("Download Excel (with snippets)", build_xlsx(df, res["snips"]),
@@ -431,6 +527,9 @@ def main():
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         d3.download_button("Download all snippets (ZIP)", build_zip(res["snips"]),
                            "signage_snippets.zip", "application/zip")
+        d4.download_button("Download print pack (PDF, A4 landscape)",
+                           build_pdf(df, res["snips"], up.name, pdf_summary),
+                           "signage_print_pack.pdf", "application/pdf")
         st.caption("Size (name) is only what the family name states. Size (drawing) and FFL are blank unless "
                    "read from an elevation - nothing is guessed.")
     with t2:
