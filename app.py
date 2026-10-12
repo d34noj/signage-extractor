@@ -42,7 +42,7 @@ def is_schedule_page(text: str) -> bool:
 
 def classify_page(text: str, sheet_no: str = ""):
     t = text.lower()
-    m = re.search(r"\b(L\d{2})[_ ]Signage Plan", text, re.I)
+    m = re.search(r"\b(L\d{2})[ _-]*Signage[ _-]*Plan\b", text, re.I)
     if m:
         return "plan", m.group(1).upper()
     if any(kw in t for kw in ["elevation", "elev", "internal elevation", "backwall", "shopfront", "section"]) or re.match(r"^A[45]\d{2}", sheet_no):
@@ -147,79 +147,132 @@ def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
                 if re.search(r"\bFFL\b", line) and line.strip() not in notes:
                     notes.append(line.strip())
 
-        codes = {r["code"] for r in rows}
-        # exact-token matcher, longest codes first so TK21-12 is never read as TK21-1
-        code_re = (re.compile(r"(?<![A-Z0-9_-])(" + "|".join(re.escape(c.upper()) for c in sorted(codes, key=len, reverse=True)) + r")(?![A-Z0-9_-])")
-                   if codes else None)
+        codes = {str(r["code"]).upper() for r in rows if r.get("code")}
         hits = defaultdict(list)
+        # Match every non-schedule page. Do not pre-filter with page.extract_text():
+        # CAD exports often omit or fragment code strings in the plain-text layer.
         for i, page in enumerate(pdf.pages, 1):
             sheet = ""
-            c = Counter(re.findall(r"\bA\d{3}\b", texts[i]))
+            c = Counter(re.findall(r"\\bA\\d{3}\\b", texts[i], re.I))
             if c:
-                sheet = c.most_common(1)[0][0]
+                sheet = c.most_common(1)[0][0].upper()
 
             kind, plevel = classify_page(texts[i], sheet) if i not in sched_pages else ("schedule", "")
-            
             n_codes_here = 0
-            if i not in sched_pages and any(code in texts[i] for code in codes):
-                if kind == "other":
-                    kind = "elevation"
+            if i not in sched_pages and codes:
+                try:
+                    words = page.extract_words(
+                        x_tolerance=2, y_tolerance=3, keep_blank_chars=False,
+                        use_text_flow=False
+                    )
+                except Exception:
+                    words = []
 
-                # CAD PDFs often split a visible code (e.g. TK21-12) across several
-                # PDF words/chars. Search spatial text lines as well as individual words.
-                words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False)
-
-                # Group words into visual lines, preserving geometry so a fragmented code
-                # can be mapped back to a sensible bounding box for the crop.
+                # Cluster words by baseline. A code may be represented as TK21, -, 12.
                 line_groups = []
-                for w in sorted(words, key=lambda x: (round(x["top"] / 3), x["x0"])):
-                    target = None
-                    for g in line_groups[-6:]:
-                        if abs(g["top"] - w["top"]) <= 4:
-                            target = g
-                            break
+                for w in sorted(words, key=lambda x: (x["top"], x["x0"])):
+                    target = next((g for g in reversed(line_groups[-8:])
+                                   if abs(g["top"] - w["top"]) <= 4), None)
                     if target is None:
                         target = {"top": w["top"], "words": []}
                         line_groups.append(target)
                     target["words"].append(w)
 
-                seen_hits = set()
+                found_on_page = []
                 for g in line_groups:
                     lw = sorted(g["words"], key=lambda x: x["x0"])
-                    # Build both spaced and compact forms. Compact catches TK21 - 12,
-                    # while the spaced form avoids joining unrelated distant labels.
-                    spaced = " ".join(w["text"] for w in lw).upper()
-                    compact = re.sub(r"\s+", "", spaced)
-                    for matched_code in codes:
-                        mc = matched_code.upper()
-                        positions = []
-                        if mc in spaced:
-                            positions.append(mc)
-                        if mc.replace(" ", "") in compact:
-                            positions.append(mc)
-                        if not positions:
+                    # Avoid joining unrelated labels far apart on a drawing line.
+                    clusters = []
+                    for w in lw:
+                        if not clusters or w["x0"] - clusters[-1][-1]["x1"] > 36:
+                            clusters.append([w])
+                        else:
+                            clusters[-1].append(w)
+                    for cluster in clusters:
+                        compact_chars, char_words = [], []
+                        for w in cluster:
+                            token = re.sub(r"\\s+", "", str(w.get("text", "")).upper())
+                            compact_chars.extend(token)
+                            char_words.extend([w] * len(token))
+                        compact = "".join(compact_chars)
+                        if not compact:
                             continue
+                        for matched_code in sorted(codes, key=len, reverse=True):
+                            mc = re.sub(r"\\s+", "", matched_code.upper())
+                            # Ignore matches embedded in a longer alphanumeric code.
+                            pat = re.compile(r"(?<![A-Z0-9])" + re.escape(mc) + r"(?![A-Z0-9])")
+                            for match in pat.finditer(compact):
+                                matched_words = char_words[match.start():match.end()]
+                                if not matched_words:
+                                    continue
+                                x0 = min(w["x0"] for w in matched_words)
+                                x1 = max(w["x1"] for w in matched_words)
+                                top = min(w["top"] for w in matched_words)
+                                bottom = max(w["bottom"] for w in matched_words)
+                                found_on_page.append((matched_code, x0, x1, top, bottom))
 
-                        # Prefer words overlapping the code's component tokens; otherwise
-                        # use a compact local cluster around the nearest TK-prefixed word.
-                        parts = [x for x in re.split(r"[-_]", mc) if x]
-                        cand = [w for w in lw if any(part in w["text"].upper() for part in parts)]
-                        if not cand:
-                            cand = [w for w in lw if "TK" in w["text"].upper()]
-                        if not cand:
-                            continue
-                        x0 = min(w["x0"] for w in cand); x1 = max(w["x1"] for w in cand)
-                        top = min(w["top"] for w in cand); bottom = max(w["bottom"] for w in cand)
-                        dedupe = (matched_code, round(x0), round(top))
-                        if dedupe in seen_hits:
-                            continue
-                        seen_hits.add(dedupe)
-                        n_codes_here += 1
-                        h = {"page": i, "kind": kind, "level": plevel, "sheet": sheet,
-                             "x0": x0, "x1": x1, "top": top, "bottom": bottom, "view": ""}
-                        if kind == "elevation":
-                            h["view"] = nearest_view_title(words, h)
-                        hits[matched_code].append(h)
+                # Character-level fallback catches PDFs whose word segmentation is unusable.
+                if not found_on_page:
+                    try:
+                        chars = [ch for ch in page.chars if str(ch.get("text", "")).strip()]
+                    except Exception:
+                        chars = []
+                    char_lines = []
+                    for ch in sorted(chars, key=lambda x: (x["top"], x["x0"])):
+                        target = next((g for g in reversed(char_lines[-10:])
+                                       if abs(g["top"] - ch["top"]) <= 3), None)
+                        if target is None:
+                            target = {"top": ch["top"], "chars": []}
+                            char_lines.append(target)
+                        target["chars"].append(ch)
+                    for g in char_lines:
+                        line_chars = sorted(g["chars"], key=lambda x: x["x0"])
+                        compact_chars, char_boxes = [], []
+                        prev = None
+                        for ch in line_chars:
+                            # Large horizontal gaps separate drawing labels; keep them separate.
+                            if prev is not None and ch["x0"] - prev["x1"] > 36:
+                                compact_chars.append(" ")
+                                char_boxes.append(None)
+                            token = re.sub(r"\\s+", "", str(ch.get("text", "")).upper())
+                            compact_chars.extend(token)
+                            char_boxes.extend([ch] * len(token))
+                            prev = ch
+                        compact = "".join(compact_chars)
+                        for matched_code in sorted(codes, key=len, reverse=True):
+                            mc = re.sub(r"\\s+", "", matched_code.upper())
+                            pat = re.compile(r"(?<![A-Z0-9])" + re.escape(mc) + r"(?![A-Z0-9])")
+                            for match in pat.finditer(compact):
+                                boxes = [b for b in char_boxes[match.start():match.end()] if b]
+                                if boxes:
+                                    found_on_page.append((
+                                        matched_code,
+                                        min(b["x0"] for b in boxes), max(b["x1"] for b in boxes),
+                                        min(b["top"] for b in boxes), max(b["bottom"] for b in boxes)
+                                    ))
+
+                seen_hits = set()
+                for matched_code, x0, x1, top, bottom in found_on_page:
+                    dedupe = (matched_code, round(x0), round(top))
+                    if dedupe in seen_hits:
+                        continue
+                    seen_hits.add(dedupe)
+                    n_codes_here += 1
+                    # Plan detection uses the page title and level. Other code-bearing sheets
+                    # are retained as elevation candidates rather than discarded.
+                    hit_kind = kind
+                    if hit_kind == "other":
+                        hit_kind = "elevation"
+                    h = {"page": i, "kind": hit_kind, "level": plevel, "sheet": sheet,
+                         "x0": x0, "x1": x1, "top": top, "bottom": bottom, "view": ""}
+                    if hit_kind == "elevation":
+                        h["view"] = nearest_view_title(words, h)
+                    hits[matched_code].append(h)
+
+                    # If a code is found, retain the page as a candidate in diagnostics.
+                    if kind == "other":
+                        kind = "elevation"
+
             page_rows.append({"page": i, "type": kind, "level": plevel, "sheet": sheet,
                               "chars": len(texts[i]), "codes_found": n_codes_here})
 
@@ -500,6 +553,9 @@ def run_vision(res, keys, api_key, model, state):
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     by_key = {f"{r['level']}|{r['code']}": r for r in res["rows"]}
+    if not keys:
+        st.info("There are no signs with elevation snippets to read.")
+        return
     bar = st.progress(0.0, text="Reading drawings...")
     for n, key in enumerate(keys, 1):
         snips = [s for s in res["snips"].get(key, []) if s["kind"] == "elevation"]
@@ -525,7 +581,11 @@ def tk_mode():
         st.divider()
         st.subheader("Vision read (optional)")
         api_key = get_api_key() or st.text_input("Anthropic API key", type="password")
-        model = st.selectbox("Model", ["claude-haiku-5-5", "claude-sonnet-5-5"])
+        model = st.text_input(
+            "Anthropic model ID",
+            value=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+            help="Use a model ID enabled for your Anthropic account; can also be set with ANTHROPIC_MODEL."
+        )
 
     up = st.file_uploader("Upload the TK Maxx drawing pack (PDF)", type=["pdf"], key="tk_pdf")
     if not up:

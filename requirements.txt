@@ -1,5 +1,6 @@
 streamlit
 pdfplumber
+pypdfium2
 pandas
 openpyxl
 pillow
