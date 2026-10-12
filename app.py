@@ -165,13 +165,58 @@ def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
                 if kind == "other":
                     kind = "elevation"
 
-                words = page.extract_words()
-                for w in words:
-                    found = code_re.findall(w["text"].upper()) if code_re else []
-                    for matched_code in dict.fromkeys(found):
+                # CAD PDFs often split a visible code (e.g. TK21-12) across several
+                # PDF words/chars. Search spatial text lines as well as individual words.
+                words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False)
+
+                # Group words into visual lines, preserving geometry so a fragmented code
+                # can be mapped back to a sensible bounding box for the crop.
+                line_groups = []
+                for w in sorted(words, key=lambda x: (round(x["top"] / 3), x["x0"])):
+                    target = None
+                    for g in line_groups[-6:]:
+                        if abs(g["top"] - w["top"]) <= 4:
+                            target = g
+                            break
+                    if target is None:
+                        target = {"top": w["top"], "words": []}
+                        line_groups.append(target)
+                    target["words"].append(w)
+
+                seen_hits = set()
+                for g in line_groups:
+                    lw = sorted(g["words"], key=lambda x: x["x0"])
+                    # Build both spaced and compact forms. Compact catches TK21 - 12,
+                    # while the spaced form avoids joining unrelated distant labels.
+                    spaced = " ".join(w["text"] for w in lw).upper()
+                    compact = re.sub(r"\s+", "", spaced)
+                    for matched_code in codes:
+                        mc = matched_code.upper()
+                        positions = []
+                        if mc in spaced:
+                            positions.append(mc)
+                        if mc.replace(" ", "") in compact:
+                            positions.append(mc)
+                        if not positions:
+                            continue
+
+                        # Prefer words overlapping the code's component tokens; otherwise
+                        # use a compact local cluster around the nearest TK-prefixed word.
+                        parts = [x for x in re.split(r"[-_]", mc) if x]
+                        cand = [w for w in lw if any(part in w["text"].upper() for part in parts)]
+                        if not cand:
+                            cand = [w for w in lw if "TK" in w["text"].upper()]
+                        if not cand:
+                            continue
+                        x0 = min(w["x0"] for w in cand); x1 = max(w["x1"] for w in cand)
+                        top = min(w["top"] for w in cand); bottom = max(w["bottom"] for w in cand)
+                        dedupe = (matched_code, round(x0), round(top))
+                        if dedupe in seen_hits:
+                            continue
+                        seen_hits.add(dedupe)
                         n_codes_here += 1
                         h = {"page": i, "kind": kind, "level": plevel, "sheet": sheet,
-                             "x0": w["x0"], "x1": w["x1"], "top": w["top"], "bottom": w["bottom"], "view": ""}
+                             "x0": x0, "x1": x1, "top": top, "bottom": bottom, "view": ""}
                         if kind == "elevation":
                             h["view"] = nearest_view_title(words, h)
                         hits[matched_code].append(h)
@@ -192,6 +237,11 @@ def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
             plan = [h for h in hits[code] if h["kind"] == "plan" and h["level"] == level]
             pages_found = sorted({(h["page"], h["kind"], h["sheet"] or h["level"]) for h in hits[code]})
 
+            # Prefer genuine elevation sheets with a nearby view title over incidental
+            # references elsewhere in the pack. Stable page order breaks ties.
+            elev = sorted(elev, key=lambda h: (0 if h.get("view") else 1,
+                                                0 if h.get("sheet", "").startswith(("A4", "A5")) else 1,
+                                                h["page"]))
             chosen = [(h, "elevation") for h in elev[:elev_n]]
             if incl_plan and plan:
                 chosen.append((plan[0], "plan"))
