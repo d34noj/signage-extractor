@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw
 st.set_page_config(page_title="Store Signage Schedule Extractor", layout="wide")
 
 # --------------------------------------------------------------------------------------
-# Patterns - tweak here if a pack uses a different code format
+# Patterns
 # --------------------------------------------------------------------------------------
 CODE_PATTERN = r"(?:TK\d{2}(?:-\d{1,3}[A-Z]{0,2})?(?:-[A-Z]{1,2})?|TKM-\d+[A-Z]*|TK_[A-Za-z]+)"
 ROW_RE = re.compile(rf"^(L\d{{2}})\s+(.+?)\s+({CODE_PATTERN})\s+(\d+)\b(.*)$")
@@ -713,3 +713,55 @@ if uploaded_file:
             dpi = st.slider("Render DPI", 72, 200, 110)
 
         with st.spinner("Analyzing TK Maxx PDF pack..."):
+            res = analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi)
+
+        vision_data = {}
+        if anthropic_key and st.button("Run Claude Vision Extraction on Crops"):
+            import anthropic
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            prog = st.progress(0)
+            items = list(res["snips"].items())
+            for idx, (key, lst) in enumerate(items):
+                level, code = key.split("|")
+                row = next((r for r in res["rows"] if r["code"] == code and r["level"] == level), None)
+                if row and lst:
+                    try:
+                        vision_data[key] = vision_read(client, "claude-3-5-sonnet-20241022", lst[0]["png"], row, res["notes"])
+                    except Exception as e:
+                        st.warning(f"Vision failed for {code}: {e}")
+                prog.progress((idx + 1) / len(items))
+
+        df = build_df(res, vision_data)
+        st.success(f"Parsed {len(df)} signage items successfully!")
+        st.dataframe(df, use_container_width=True)
+
+        st.subheader("Download Reports")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button("Download Excel (.xlsx)", data=build_xlsx(df, res["snips"]), file_name="signage_schedule.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with d2:
+            st.download_button("Download Snippets (.zip)", data=build_zip(res["snips"]), file_name="signage_snippets.zip", mime="application/zip")
+        with d3:
+            st.download_button("Download Summary PDF", data=build_pdf(df, res["snips"], uploaded_file.name), file_name="signage_pack.pdf", mime="application/pdf")
+
+    else:
+        st.subheader("M&S Sign Manual Register")
+        pages = ms_analyse(pdf_bytes)
+        doc = ms_open(digest, pdf_bytes)
+
+        ms_rows = []
+        for p in pages:
+            if p["kind"] == "Sign sheet":
+                q, q_note = ms_proposed_qty(p)
+                ms_rows.append({
+                    "Page": p["page"],
+                    "Drawing No": p["drawing_no"],
+                    "Description": p["description"],
+                    "Qty": q if q is not None else "Check",
+                    "Qty Note": q_note,
+                    "Scale": p["scale"],
+                    "Rev": p["rev"],
+                })
+        ms_df = pd.DataFrame(ms_rows)
+        st.dataframe(ms_df, use_container_width=True)
+        st.info("Switch to TK Maxx mode for full layout snippet cropping, or use the M&S manual register breakdown above.")
