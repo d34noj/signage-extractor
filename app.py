@@ -1,7 +1,7 @@
 """
 Store Signage Schedule Extractor
 --------------------------------
-Run:   streamlit run signage_extractor.py
+Run:   streamlit run app.py
 Needs: pip install streamlit pdfplumber pandas openpyxl pillow reportlab anthropic
        (pypdfium2 comes with pdfplumber)
 
@@ -218,34 +218,4 @@ def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
                 "kind": k, "page": h["page"], "sheet": h["sheet"], "view": h["view"],
                 "label": f"{k} p{h['page']} {h['sheet']} {h['view']}".strip(),
                 "png": get_crop(h, ehw, ehh) if k == "elevation" else get_crop(h, phw, phh),
-            } for h, k in chosen]
-
-            pos = []
-            if plan:
-                pos.append(f"{level} plan")
-            seen = set()
-            for h in elev:
-                label = f"{h['sheet']} {h['view']}".strip()
-                if label and label not in seen:
-                    seen.add(label)
-                    pos.append(label)
-            n_plan = len(plan)
-            if n_plan == 0:
-                plan_check = "not tagged on plan"
-            elif n_plan == r["qty"]:
-                plan_check = "OK"
-            else:
-                plan_check = f"plan shows {n_plan}"
-            issues = []
-            if not hits[code]:
-                issues.append("code not found on any drawing")
-            if n_plan and n_plan != r["qty"]:
-                issues.append("qty differs from plan")
-
-            out_rows.append({**r, "size_name": size_from_name(r["desc"]),
-                             "position": "; ".join(pos[:4]), "plan_check": plan_check,
-                             "check": "; ".join(issues),
-                             "pages": ", ".join(f"p{p} {k} {s}".strip() for p, k, s in pages_found)})
-
-    return {"rows": out_rows, "snips": snips, "unmatched": unmatched, "notes": notes,
-            "pages": page_rows, "schedule_pages": sched_pages, "fallback
+            }
