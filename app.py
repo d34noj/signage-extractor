@@ -420,7 +420,7 @@ def build_pdf(df, snips, source_name="", summary=True) -> bytes:
             story.append(Paragraph("No plan or elevation reference found for this sign.", fact))
         else:
             each_w = frame_w / len(lst) - 6
-            cells = [[[fit(s["png"], each_w, img_area_h - 14), Paragraph(escape(s["label"]), cap)]
+            cells = [[[fit(s["png"], each_w, img_area_h - 14), Paragraph(escape(s["label"], cap))]
                      for s in lst]]
             it = Table(cells, colWidths=[frame_w / len(lst)] * len(lst))
             it.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
