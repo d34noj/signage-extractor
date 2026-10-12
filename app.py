@@ -148,6 +148,9 @@ def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
                     notes.append(line.strip())
 
         codes = {r["code"] for r in rows}
+        # exact-token matcher, longest codes first so TK21-12 is never read as TK21-1
+        code_re = (re.compile(r"(?<![A-Z0-9_-])(" + "|".join(re.escape(c.upper()) for c in sorted(codes, key=len, reverse=True)) + r")(?![A-Z0-9_-])")
+                   if codes else None)
         hits = defaultdict(list)
         for i, page in enumerate(pdf.pages, 1):
             sheet = ""
@@ -164,9 +167,8 @@ def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
 
                 words = page.extract_words()
                 for w in words:
-                    tok = w["text"].strip(".,;:()[]/\\")
-                    matched_code = next((c for c in codes if c in tok or tok in c), None)
-                    if matched_code:
+                    found = code_re.findall(w["text"].upper()) if code_re else []
+                    for matched_code in dict.fromkeys(found):
                         n_codes_here += 1
                         h = {"page": i, "kind": kind, "level": plevel, "sheet": sheet,
                              "x0": w["x0"], "x1": w["x1"], "top": w["top"], "bottom": w["bottom"], "view": ""}
@@ -428,4 +430,174 @@ def build_pdf(df, snips, source_name="", summary=True) -> bytes:
         if n < n_rows:
             story.append(PageBreak())
 
-    doc.build(story, on
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------------------
+def get_api_key() -> str:
+    try:
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def run_vision(res, keys, api_key, model, state):
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    by_key = {f"{r['level']}|{r['code']}": r for r in res["rows"]}
+    bar = st.progress(0.0, text="Reading drawings...")
+    for n, key in enumerate(keys, 1):
+        snips = [s for s in res["snips"].get(key, []) if s["kind"] == "elevation"]
+        if snips and key not in state:
+            try:
+                state[key] = vision_read(client, model, snips[0]["png"], by_key[key], res["notes"])
+            except Exception as e:
+                state[key] = {"evidence": f"read failed: {e}"}
+        bar.progress(n / len(keys), text=f"Reading drawings... {n}/{len(keys)}")
+    bar.empty()
+
+
+def tk_mode():
+    with st.sidebar:
+        st.header("Settings")
+        elev_n = st.slider("Elevation snippets per sign", 1, 3, 1)
+        incl_plan = st.checkbox("Also include a plan snippet", value=True)
+        ehw = st.slider("Elevation crop half-width (pt)", 50, 600, 220, 10)
+        ehh = st.slider("Elevation crop half-height (pt)", 50, 600, 160, 10)
+        phw = st.slider("Plan crop half-width (pt)", 50, 600, 150, 10)
+        phh = st.slider("Plan crop half-height (pt)", 50, 600, 110, 10)
+        dpi = st.select_slider("Snippet resolution (dpi)", options=[100, 150, 200, 250], value=150)
+        st.divider()
+        st.subheader("Vision read (optional)")
+        api_key = get_api_key() or st.text_input("Anthropic API key", type="password")
+        model = st.selectbox("Model", ["claude-haiku-5-5", "claude-sonnet-5-5"])
+
+    up = st.file_uploader("Upload the TK Maxx drawing pack (PDF)", type=["pdf"], key="tk_pdf")
+    if not up:
+        st.info("Upload a pack to get the schedule, one page per sign, and a check sheet.")
+        return
+
+    pdf_bytes = up.getvalue()
+    file_id = hashlib.md5(pdf_bytes).hexdigest()
+    try:
+        res = analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi)
+    except Exception as e:
+        st.error(f"Couldn't read that PDF: {e}")
+        return
+
+    if not res["rows"]:
+        st.error("No schedule rows found. Check this is the TK drawing pack with the 'TK Code / Family and Type' schedule.")
+        return
+    if res["fallback"]:
+        st.warning("No schedule page recognised - scanned every page for rows instead. Check results carefully.")
+
+    vstore = st.session_state.setdefault("vision", {})
+    vision = vstore.setdefault(file_id, {})
+    df = build_df(res, vision)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Signs", len(df))
+    c2.metric("Total qty", int(df["Qty"].sum()))
+    c3.metric("With snippets", sum(1 for k, v in res["snips"].items() if v))
+    c4.metric("Flagged", int((df["Check"] != "").sum()))
+
+    t_sched, t_signs, t_check = st.tabs(["Schedule", "Sign by sign", "Check sheet"])
+
+    # ---- Schedule
+    with t_sched:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        d1, d2, d3, d4 = st.columns(4)
+        d1.download_button("Excel (with snippets)", build_xlsx(df, res["snips"]),
+                           f"signage_schedule.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        d2.download_button("PDF (one page per sign)", build_pdf(df, res["snips"], up.name),
+                           "signage_schedule.pdf", "application/pdf")
+        d3.download_button("Snippets (zip)", build_zip(res["snips"]), "snippets.zip", "application/zip")
+        d4.download_button("CSV", df.to_csv(index=False).encode("utf-8"), "signage_schedule.csv", "text/csv")
+
+        st.divider()
+        if api_key:
+            if st.button("Read sizes / FFL from drawings (all signs)"):
+                run_vision(res, list(res["snips"].keys()), api_key, model, vision)
+                st.rerun()
+            st.caption("Vision reads only what's drawn on the crop - always check against the evidence column.")
+        else:
+            st.caption("Add an Anthropic API key in the sidebar to read sizes and FFL off the drawings.")
+
+    # ---- Sign by sign
+    with t_signs:
+        labels = [f"{r['Level']}  {r['Sign Code']}  -  {r['Description']}" for _, r in df.iterrows()]
+        st.session_state.setdefault("sign_idx", 0)
+        st.session_state["sign_idx"] = min(st.session_state["sign_idx"], len(labels) - 1)
+
+        def step(d):
+            st.session_state["sign_idx"] = (st.session_state["sign_idx"] + d) % len(labels)
+
+        nav1, nav2, nav3 = st.columns([1, 6, 1])
+        nav1.button("< Prev", on_click=step, args=(-1,), use_container_width=True)
+        nav3.button("Next >", on_click=step, args=(1,), use_container_width=True)
+        nav2.selectbox("Sign", range(len(labels)), format_func=lambda i: labels[i],
+                       key="sign_idx", label_visibility="collapsed")
+
+        i = st.session_state["sign_idx"]
+        r = df.iloc[i]
+        key = f"{r['Level']}|{r['Sign Code']}"
+        st.subheader(f"{r['Sign Code']}  |  {r['Level']}  |  Qty {r['Qty']}")
+        st.write(r["Description"])
+        f1, f2 = st.columns(2)
+        f1.markdown(f"**Size:** {r['Size (drawing)'] or r['Size (name)'] or '-'}")
+        f1.markdown(f"**FFL:** {r['FFL'] or '-'}")
+        f2.markdown(f"**Position:** {r['Position'] or '-'}")
+        f2.markdown(f"**Check:** {r['Check'] or r['Plan check']}")
+        if r["Evidence"]:
+            st.caption(f"Evidence: {r['Evidence']} ({r['Read confidence']} confidence)")
+
+        if api_key and st.button("Read this sign from the drawing", key=f"vr_{key}"):
+            run_vision(res, [key], api_key, model, vision)
+            st.rerun()
+
+        snips = res["snips"].get(key, [])
+        if not snips:
+            st.warning("No plan or elevation reference found for this sign.")
+        else:
+            cols = st.columns(len(snips))
+            for col, s in zip(cols, snips):
+                col.image(s["png"], caption=s["label"], use_container_width=True)
+
+    # ---- Check sheet
+    with t_check:
+        flagged = df[df["Check"] != ""]
+        if flagged.empty:
+            st.success("Every sign was found on the drawings and plan quantities agree.")
+        else:
+            st.markdown("**Signs to look at**")
+            st.dataframe(flagged[["Level", "Sign Code", "Description", "Qty", "Plan check", "Check"]],
+                         use_container_width=True, hide_index=True)
+        if res["unmatched"]:
+            st.markdown("**Schedule lines that looked like signs but didn't parse**")
+            st.code("\n".join(res["unmatched"]))
+        if res["notes"]:
+            st.markdown("**FFL notes found on the drawings**")
+            for n in res["notes"][:15]:
+                st.write(f"- {n}")
+        with st.expander("How each page was classified"):
+            st.dataframe(pd.DataFrame(res["pages"]), use_container_width=True, hide_index=True)
+
+
+def ms_mode():
+    st.info("M&S mode isn't built into this version yet. Gemini's rebuild only contains the TK Maxx extractor. "
+            "To do M&S the same way (sign per page, snippets, check sheet) I need a few pages of the M&S "
+            "binder - the schedule/legend page and one or two elevations - to see how their sign codes are laid out.")
+
+
+st.title("Store Signage Schedule Extractor")
+mode = st.radio("Retailer", ["TK Maxx", "M&S"], horizontal=True, label_visibility="collapsed")
+if mode == "TK Maxx":
+    tk_mode()
+else:
+    ms_mode()
