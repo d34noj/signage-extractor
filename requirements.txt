@@ -1,5 +1,6 @@
 streamlit
-pdfplumber>=0.10
+pdfplumber
+pypdfium2
 pandas
 openpyxl
 pillow
