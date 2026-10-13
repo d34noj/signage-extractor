@@ -2283,6 +2283,134 @@ def ck_report_pdf(title, subtitle, metrics, sections, notes=(), status_cols=("St
     return buf.getvalue()
 
 
+# ---- Drawing check (optional, API): read height / FFL / colour / wording from BOTH drawings and compare -----------
+DRAW_PROMPT = """You are reading one signage drawing for a sign-manufacturing check. The sign is: "{title}" (code {code}).
+The image is {where}. Read ONLY what is drawn for this sign - dimensions, colours and wording on or next to it. On a client elevation the sign is the one that the boxed tag "{code}" points to with its leader line; ignore neighbouring signs and their dimensions.
+Return ONLY a JSON object, no other text:
+{{"letter_height_mm": [numbers], "overall_size_mm": [numbers], "fixing_height_mm": [numbers],
+ "colours": ["white", ...], "wording": "text on the sign as you read it", "unclear": "anything you could not read or are unsure of"}}
+letter_height_mm = height of the lettering (e.g. a vertical dimension beside the letters).
+overall_size_mm = overall length / width / height of the sign itself.
+fixing_height_mm = how high it is fixed from finished floor level (FFL / AFFL).
+colours = the colour(s) the sign face / letters are shown in (use simple words: white, grey, black, orange, silver, red, green, blue, clear, opal, frosted, brass, gold, yellow).
+Use empty lists / empty strings where the drawing does not show it. Never guess."""
+
+_DRAW_COLS = r"white|grey|gray|black|orange|silver|red|green|blue|clear|opal|frosted|brass|gold|yellow|pink|purple|cream|brown"
+
+
+def _ck_img_b64(png, maxw=1800):
+    im = Image.open(io.BytesIO(png)).convert("RGB")
+    if im.size[0] > maxw:
+        im = im.resize((maxw, int(im.size[1] * maxw / im.size[0])))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=88)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def ck_draw_read(client, model, png, title, code, where, reader=None):
+    prompt = DRAW_PROMPT.format(title=title, code=code or "n/a", where=where)
+    if reader is not None:
+        text = reader(png, prompt)
+    else:
+        msg = client.messages.create(model=model, max_tokens=700, messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _ck_img_b64(png)}},
+            {"type": "text", "text": prompt}]}])
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    a, b = text.find("{"), text.rfind("}")
+    d = json.loads(text[a:b + 1])
+    num = lambda v: sorted({int(float(x)) for x in (v or []) if re.fullmatch(r"\d+(?:\.\d+)?", str(x).strip())})
+    return {"letter": num(d.get("letter_height_mm")), "size": num(d.get("overall_size_mm")), "ffl": num(d.get("fixing_height_mm")),
+            "colours": sorted({c.lower().replace("gray", "grey") for c in (d.get("colours") or []) if re.fullmatch(_DRAW_COLS, str(c).lower())}),
+            "wording": str(d.get("wording") or ""), "unclear": str(d.get("unclear") or "")}
+
+
+def ck_draw_merge(reads):
+    out = {"letter": [], "size": [], "ffl": [], "colours": [], "wording": "", "unclear": ""}
+    for r in reads:
+        for k in ("letter", "size", "ffl", "colours"):
+            out[k] = sorted(set(out[k]) | set(r[k]))
+        out["wording"] = out["wording"] or r["wording"]
+        out["unclear"] = (out["unclear"] + " " + r["unclear"]).strip()
+    return out
+
+
+def ck_draw_compare(man, pack):
+    """Rows: Item, Manual drawing, Pack drawing, Status, Note."""
+    rows = []
+    for key, label, unit in (("letter", "Letter height", "mm"), ("ffl", "Fixing height (FFL)", "mm"), ("size", "Overall size", "mm")):
+        a, b = man[key], pack[key]
+        if not a and not b:
+            continue
+        if not a or not b:
+            rows.append((label, ", ".join(f"{x}{unit}" for x in a) or "not read", ", ".join(f"{x}{unit}" for x in b) or "not read",
+                         "Not read", "Only one drawing shows it - look at both"))
+        else:
+            ok = bool(set(a) & set(b))
+            rows.append((label, ", ".join(f"{x}{unit}" for x in a), ", ".join(f"{x}{unit}" for x in b), "OK" if ok else "Check",
+                         "" if ok else "Heights/sizes differ between your sheet and the pack"))
+    a, b = man["colours"], pack["colours"]
+    if a or b:
+        if not a or not b:
+            rows.append(("Colour", ", ".join(a) or "not read", ", ".join(b) or "not read", "Not read", "Only one drawing shows a colour"))
+        else:
+            ok = bool(set(a) & set(b))
+            rows.append(("Colour", ", ".join(a), ", ".join(b), "OK" if ok else "Check", "" if ok else "Colours differ"))
+    ta, tb = ck_tokens(man["wording"], True), ck_tokens(pack["wording"], True)
+    if ta and tb:
+        ok = len(ta & tb) / min(len(ta), len(tb)) >= 0.6
+        rows.append(("Wording", man["wording"][:70], pack["wording"][:70], "OK" if ok else "Check", "" if ok else "Wording differs"))
+    return rows
+
+
+def _ck_render_page_png(pdf_bytes, pno, scale=1.6):
+    doc = pdfium.PdfDocument(pdf_bytes)
+    try:
+        pg = doc[pno - 1]
+        try:
+            im = pg.render(scale=scale).to_pil().convert("RGB")
+        finally:
+            pg.close()
+    finally:
+        doc.close()
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def ck_draw_check(client, model, signs, checks, pack, manual_bytes, only=None, reader=None, progress=None):
+    """Run the drawing read for the chosen signs. Returns [{sign, item, manual, pack, status, note}]."""
+    out = []
+    by_sign = {}
+    for r in checks:
+        by_sign.setdefault(r["Sign"], r)
+    chosen = [s for s in signs if (only is None or s["title"] in only)]
+    for n, s in enumerate(chosen):
+        r = by_sign.get(s["title"])
+        keys = r["_keys"] if r else []
+        snips = [sn for k in keys for sn in pack["snips"].get(k, [])]
+        snips = sorted(snips, key=lambda x: 0 if x.get("kind") == "elevation" else 1)[:2]
+        if progress:
+            progress(n / max(len(chosen), 1), s["title"])
+        if not snips:
+            out.append({"sign": s["title"], "item": "-", "manual": "", "pack": "no pack drawing found for this sign", "status": "Not read", "note": ""})
+            continue
+        try:
+            code = ", ".join(sorted({k.split("|")[-1] for k in keys}))[:40]
+            man = ck_draw_read(client, model, _ck_render_page_png(manual_bytes, s["pages"][0]), s["title"], code,
+                               "the manufacturer's sign sheet (detail drawing plus an elevation showing where it fits)", reader)
+            pk = ck_draw_merge([ck_draw_read(client, model, sn["png"], s["title"], code, "a crop of the client's elevation drawing around this sign", reader)
+                                for sn in snips])
+        except Exception as e:
+            out.append({"sign": s["title"], "item": "-", "manual": "", "pack": f"could not read: {e}"[:90], "status": "Not read", "note": ""})
+            continue
+        rows = ck_draw_compare(man, pk)
+        if not rows:
+            out.append({"sign": s["title"], "item": "-", "manual": "", "pack": "nothing readable on either drawing", "status": "Not read", "note": ""})
+        for it, a, b, st_, note in rows:
+            out.append({"sign": s["title"], "item": it, "manual": a, "pack": b, "status": st_, "note": note})
+    return out
+
+
 # ---- Screens: Manual Checker + Revision Checker ----------------------------------------------
 def _ck_manual_png(manual_bytes, pno, scale=0.9):
     doc = pdfium.PdfDocument(manual_bytes)
@@ -2374,8 +2502,33 @@ def manual_checker(retailer):
         if layout:
             st.caption("Skipped as layout: " + "; ".join(f"p{p['page']} {p['title']}" for p in layout))
 
+    dkey = f"mc_draw_{retailer}_{hashlib.md5(mb + pb).hexdigest()}"
+    with st.expander("Drawing check - read heights, FFL, colour and wording from both drawings (uses the API)"):
+        st.caption("Reads your sign sheet and the pack's elevation around each sign, then compares letter height, fixing height, overall size, colour "
+                   "and wording. It is a prompt to look, not a verdict - open the sign in the viewer above to confirm by eye.")
+        dkey_api = get_api_key() or st.text_input("Anthropic API key", type="password", key=f"mc_draw_key_{retailer}")
+        dmodel = st.selectbox("Model", ["claude-sonnet-5-5", "claude-haiku-5-5"], key=f"mc_draw_model_{retailer}")
+        names = [s["title"] for s in signs]
+        pick = st.multiselect("Signs to read", names, default=names, key=f"mc_draw_pick_{retailer}")
+        if st.button(f"Run drawing check on {len(pick)} sign(s)", key=f"mc_draw_go_{retailer}", disabled=not (dkey_api and pick)):
+            import anthropic
+            bar = st.progress(0.0)
+            res_d = ck_draw_check(anthropic.Anthropic(api_key=dkey_api), dmodel, signs, checks, pack, mb, set(pick),
+                                  progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
+            bar.empty()
+            st.session_state[dkey] = res_d
+        if not dkey_api:
+            st.info("Set ANTHROPIC_API_KEY (or paste a key here) to run this.")
+    draw = st.session_state.get(dkey)
+    if draw:
+        ddf = pd.DataFrame(draw).rename(columns={"sign": "Sign", "item": "Item", "manual": "Your sheet", "pack": "Pack drawing", "status": "Status", "note": "Note"})
+        st.subheader("Drawing check")
+        st.dataframe(ddf, use_container_width=True, hide_index=True)
+
     sec = [("Checks needing attention", df[df["Status"] == "Check"].drop(columns=["Dwg"]), [40, 24, 52, 62, 16, None, 14, 14]),
            ("Pack items not covered by a manual sheet", po, [70, 20, 10, 50, 16, 16, None])]
+    if draw:
+        sec.append(("Drawing check (read from the drawings by the vision model - confirm by eye)", ddf[ddf["Status"] != "OK"], [40, 30, 50, 50, 16, None]))
     pdf = ck_report_pdf(f"Manual check - {retailer}", f"{mf.name}  checked against  {pf.name}  (internal signage only)",
                         [("Signs in manual", len(summ)), ("All OK", n_ok), ("To check", len(summ) - n_ok), ("Pack, not in manual", len(po))],
                         [(h, d, w) for (h, d, w) in sec],
