@@ -392,7 +392,7 @@ MS_NOISE_RE = re.compile(
     r"SIGNAGE KEY|DESCRIPTION CHECKED|TENDER ISSUE|CONSTRUCTION ISSUE|FIRST ISSUE|SIGN\s*[:=]|RELOCATED TO AVOID|"
     r"MEDIA SCREEN|^(?:GROUND|FIRST|BASEMENT) FLOOR\b|SIGNED OFF|FIRE HOSE|QUALIFIER DETAIL|DETAIL\.? ?\d? ?: ?\d+|"
     r"MERCHANDISER|TILL ASSISTED|ASSISTED (?:WRAP|TILL)|ACC UNIT|TILL END|CARD/CARD|CARD AND CASH TILL|\bUNIT\b.{0,25}UPC|"
-    r"NOT TO EXCEED|SIZE TO BE CONFIRMED ON SITE\)? POWER", re.I)
+    r"NOT TO EXCEED|COVED|SKIRTING|PLASTERBOARD|SOFFIT|FLOOR TRANSITION|MCCUE|BUMP RAIL|POWER FOR PHONE|POWER TO BE HIDDEN|SIZE TO BE CONFIRMED ON SITE\)? POWER", re.I)
 MS_LEGEND_RE = re.compile(
     r"^(?:ILLUMINATED SIGN|NON-ILLUMINATED SIGN / ARTWORK|LIGHTBOX|MID FLOOR (?:ILLUMINATED|DIRECTIONAL) SIGNS?.*|"
     r"SUPPLEMENTARY SIGNAGE|DOOR VINYLS ARTWORK DETAILS.*|EXISTING MANIFESTATIONS REPLACED.*|EXAMPLE - MID FLOOR SIGNAGE)$", re.I)
@@ -483,7 +483,7 @@ def ms_page_kind(title, text):
     t = (title or "").lower()
     if "signage" in t or "signage key" in text.lower():
         return "plan"
-    if re.search(r"elevation|till details|till hanger|section|setting out|manifestation", t):
+    if re.search(r"elevation|till details|till hanger|section|setting out|manifestation|\bdetails\b", t):
         return "elevation"
     return "other"
 
@@ -573,13 +573,18 @@ def _ms_scan(pdf_bytes):
     """Read every page: title, drawing no., level, kind and sign callouts (text only - fast)."""
     doc = pdfium.PdfDocument(pdf_bytes)
     pages, items, nums_seen = [], [], Counter()
+    seen_sigs = set()      # a pack bound twice repeats whole sheets - repeats are skipped
     for i in range(1, len(doc) + 1):
         pg = doc[i - 1]
         try:
             runs, dw, dh = page_runs(pg)
             text = " ".join(r["t"] for r in runs)
             title, num = ms_title(runs, dw, dh)
-            kind = ms_page_kind(title, text)
+            sig = hashlib.md5(" ".join(sorted(r["t"] for r in runs)).encode()).hexdigest() if len(runs) > 5 else None
+            dup = sig is not None and (title, sig) in seen_sigs
+            if sig is not None:
+                seen_sigs.add((title, sig))
+            kind = "duplicate" if dup else ms_page_kind(title, text)
             level = ms_level(title, text)
             n = 0
             if kind in ("plan", "elevation"):
@@ -620,12 +625,14 @@ ms_scan = st.cache_data(show_spinner="Reading binder...")(_ms_scan)
 
 
 
-def _analyse_ms(pdf_bytes, include_pages, wpct, hpct, incl_plan, incl_elev):
+def _analyse_ms(pdf_bytes, include_pages, wpct, hpct, incl_plan, incl_elev, drop=()):
     sc = ms_scan(pdf_bytes)
     pages = sc["pages"]
     auto = {p["page"] for p in pages if p["type"] in ("plan", "elevation") and p["callouts"]}
     sel = set(include_pages) if include_pages else auto
-    items = [it for it in sc["items"] if it["page"] in sel] if include_pages else [it for it in sc["items"] if it["page"] in sel]
+    items = [it for it in sc["items"] if it["page"] in sel]
+    if drop:   # callouts already accounted for (signage key box, artwork refs consumed by a numbered circle)
+        items = [it for it in items if not any(it["page"] == p and _ms_rect_hit(it["box"], bx) for p, bx in drop)]
 
     # ---- group identical callouts (same sign called out on several plans / floors)
     groups = []
@@ -762,6 +769,467 @@ def _analyse_ms(pdf_bytes, include_pages, wpct, hpct, incl_plan, incl_elev):
 
 
 analyse_ms = st.cache_data(show_spinner="Building M&S schedule...")(_analyse_ms)
+
+
+# --------------------------------------------------------------------------------------
+# M&S v2: signage KEY driven (numbered circles on the elevations -> numbered key entries)
+# --------------------------------------------------------------------------------------
+GENERIC_KEY_RE = re.compile(r"see elevations|graphics|artwork|local brand|lightbox", re.I)
+
+
+def join_line_runs(rs):
+    """Join text runs on one line; runs split mid-word by the PDF ('opaq' + 'ue') are glued back together."""
+    rs = sorted(rs, key=lambda r: r["x0"])
+    out = ""
+    for k, r in enumerate(rs):
+        if k:
+            gap = r["x0"] - rs[k - 1]["x1"]
+            out += (" " if gap > 0.30 * max(r["h"], 1.0) else "") + r["t"]
+        else:
+            out = r["t"]
+    return out
+
+
+def lines_from_runs(rs):
+    rs = sorted(rs, key=lambda r: (r["y0"] + r["y1"]) / 2)
+    lines, cur, cy = [], [], None
+    for r in rs:
+        c = (r["y0"] + r["y1"]) / 2
+        if cur and abs(c - cy) <= 0.6 * r["h"]:
+            cur.append(r)
+        else:
+            if cur:
+                lines.append(cur)
+            cur, cy = [r], c
+    if cur:
+        lines.append(cur)
+    return [join_line_runs(l) for l in lines]
+
+
+def find_bubbles(page, runs, dmin=8.0, dmax=40.0):
+    """Numbers (1-2 digits) enclosed in a near-square/round vector path -> list of bubble dicts."""
+    tf, dw, dh = geom(page)
+    sq = []
+    for o in page.get_objects(max_depth=3):
+        if o.type == 2:                                   # path
+            l, b, r, t = o.get_bounds()
+            x0, y0, x1, y1 = box_tf(tf, l, b, r, t)
+            w, h = x1 - x0, y1 - y0
+            if dmin < w < dmax and h > 0 and 0.85 < w / h < 1.18:
+                sq.append((x0, y0, x1, y1))
+    out = []
+    for r in runs:
+        if not re.fullmatch(r"\d{1,2}", r["t"]):
+            continue
+        cx, cy = (r["x0"] + r["x1"]) / 2, (r["y0"] + r["y1"]) / 2
+        enc = [s for s in sq if s[0] < cx < s[2] and s[1] < cy < s[3]]
+        if enc:
+            s = min(enc, key=lambda s: s[2] - s[0])
+            out.append({"n": int(r["t"]), "cx": (s[0] + s[2]) / 2, "cy": (s[1] + s[3]) / 2,
+                        "d": s[2] - s[0], "th": r["h"], "box": s})
+    return out
+
+
+def find_loose_numbers(runs, bubbles, valid, th, rect=None):
+    """Numbers that match a key number and the key's label text size but whose circle outline wasn't recognised
+    (some sign circles are drawn with curve segments the shape filter rejects)."""
+    out = []
+    for r in runs:
+        if not re.fullmatch(r"\d{1,2}", r["t"]) or int(r["t"]) not in valid or abs(r["h"] - th) > 0.6:
+            continue
+        cx, cy = (r["x0"] + r["x1"]) / 2, (r["y0"] + r["y1"]) / 2
+        if any(abs(b["cx"] - cx) < 9 and abs(b["cy"] - cy) < 9 for b in bubbles):
+            continue
+        box = (cx - 7, cy - 7, cx + 7, cy + 7)
+        if rect and _ms_rect_hit(box, rect):
+            continue
+        out.append({"n": int(r["t"]), "cx": cx, "cy": cy, "d": 14.2, "th": r["h"], "box": box, "loose": True})
+    return out
+
+
+def ms_parse_key(runs, bubbles):
+    """Read a 'SIGNAGE KEY' box: numbered entries '(n) Name / spec'. Returns (entries, rect) or ([], None)."""
+    heads = [r for r in runs if re.fullmatch(r"SIGNAGE KEY", r["t"].strip(), re.I)]
+    if not heads:
+        return [], None
+    hd = heads[0]
+    kb = sorted([b for b in bubbles if b["cy"] > hd["y1"] - 2 and abs(b["cx"] - hd["x0"]) < 40], key=lambda b: b["cy"])
+    seq, want = [], 1
+    for b in kb:                                          # a key counts up 1, 2, 3 ... - stop at the first break
+        if b["n"] == want:
+            seq.append(b)
+            want += 1
+    if not seq:
+        return [], None
+    xlim = hd["x0"] + 260
+    tidy = lambda x: re.sub(r"(?<=[a-z]) ?- ?(?=[a-z])", "-", x)
+    entries = []
+    for i, b in enumerate(seq):
+        y0 = b["cy"] - b["d"] / 2 - 3
+        y1 = seq[i + 1]["cy"] - seq[i + 1]["d"] / 2 - 3 if i + 1 < len(seq) else b["cy"] + 75
+        rs = [r for r in runs if b["cx"] + b["d"] / 2 - 2 < r["x0"] < xlim and y0 <= (r["y0"] + r["y1"]) / 2 < y1]
+        ls = [l for l in lines_from_runs(rs) if l.strip(" -")]
+        if not ls:
+            continue
+        entries.append({"n": b["n"], "name": tidy(ls[0].strip()), "desc": tidy(" ".join(ls[1:]).strip()),
+                        "text": tidy(" ".join(ls).strip()), "bd": b["d"], "th": b["th"]})
+    rect = (hd["x0"] - 12, hd["y0"] - 8, xlim, seq[-1]["cy"] + 80)
+    return entries, rect
+
+
+def ms_view_label(t):
+    t = re.sub(r"^(?:[A-Z]\s+)+(?=PROPOSED)", "", t.strip())
+    t = re.sub(r"^PROPOSED\s+", "", t)
+    return " ".join(w if re.fullmatch(r"[A-Z]|\(.*\)", w) else w.capitalize() for w in t.split())
+
+
+def ms_view_titles(runs):
+    """View titles ('PROPOSED INTERNAL ELEVATION C') - left-anchored, set just under their view."""
+    return [r for r in runs if len(r["t"]) < 70 and r["h"] > 9 and re.search(r"\bPROPOSED\b", r["t"])
+            and re.search(r"\b(?:ELEVATION|SECTION)\b", r["t"]) and not re.search(r"SIGNAGE|DETAILS", r["t"])]
+
+
+def ms_view_title(runs, pt, titles=None):
+    """The view a point sits in: nearest title below it; in that row the right-most title to its left."""
+    titles = titles if titles is not None else ms_view_titles(runs)
+    cx, cy = pt
+    c = [(r["y0"] - cy, r) for r in titles if r["y0"] >= cy - 5 and r["x0"] <= cx + 40]
+    if not c:
+        return ""
+    m = min(d for d, _ in c)
+    row = [r for d, r in c if d <= m + 60]
+    return ms_view_label(max(row, key=lambda r: r["x0"])["t"])
+
+
+def _ms_rect_hit(box, rect, pad=0.0):
+    return not (box[2] < rect[0] - pad or box[0] > rect[2] + pad or box[3] < rect[1] - pad or box[1] > rect[3] + pad)
+
+
+def ms_size_from_text(t):
+    m = re.search(r"(\d{3,4})\s*[xX×]\s*(\d{3,4})\s*mm", t)
+    if m:
+        return f"{m.group(1)} x {m.group(2)}mm"
+    m = re.search(r"\b(\d{2,4})\s*mm\b", t)
+    return f"{m.group(1)}mm" if m else ""
+
+
+def _ms_keyscan(pdf_bytes):
+    """Which pages carry a SIGNAGE KEY, and what does it say?"""
+    doc = pdfium.PdfDocument(pdf_bytes)
+    out = {}
+    try:
+        for i in range(1, len(doc) + 1):
+            pg = doc[i - 1]
+            try:
+                runs, dw, dh = page_runs(pg)
+                if not any(re.fullmatch(r"SIGNAGE KEY", r["t"].strip(), re.I) for r in runs):
+                    continue
+                entries, rect = ms_parse_key(runs, find_bubbles(pg, runs))
+                if entries:
+                    out[i] = {"entries": entries, "rect": rect}
+            finally:
+                pg.close()
+    finally:
+        doc.close()
+    return out
+
+
+ms_keyscan = st.cache_data(show_spinner="Looking for the signage key...")(_ms_keyscan)
+
+
+def _analyse_ms_key(pdf_bytes, key_page, apply_pages, wpct, hpct, incl_plan, incl_elev, extra_pages):
+    """Key-driven M&S schedule. key_page = sheet holding the master SIGNAGE KEY; apply_pages = sheets whose numbered
+    circles refer to it; extra_pages = sheets also read for text callouts that are not in the key."""
+    ks = ms_keyscan(pdf_bytes)
+    entries, key_rect = ks[key_page]["entries"], ks[key_page]["rect"]
+    by_n = {e["n"]: e for e in entries}
+    kd_main = sorted(e["bd"] for e in entries)[len(entries) // 2]
+    scan = ms_scan(pdf_bytes)
+    page_info = {p["page"]: p for p in scan["pages"]}
+    doc = pdfium.PdfDocument(pdf_bytes)
+    hits, drop, notes = [], [], []
+    try:
+        for pn in apply_pages:
+            pg = doc[pn - 1]
+            try:
+                runs, dw, dh = page_runs(pg)
+                own = ks.get(pn)                       # a sheet with its own key box: use it for the circle size
+                kd = sorted(e["bd"] for e in own["entries"])[len(own["entries"]) // 2] if own else kd_main
+                allb = find_bubbles(pg, runs)
+                bub = [b for b in allb if abs(b["d"] - kd) <= 0.12 * kd and b["n"] in by_n]
+                kth = sorted(e["th"] for e in entries)[len(entries) // 2]
+                bub += find_loose_numbers(runs, allb, set(by_n), kth, (own or ks[key_page])["rect"])
+                if own:
+                    bub = [b for b in bub if not _ms_rect_hit(b["box"], own["rect"])]
+                    drop.append((pn, own["rect"]))
+                    for e2 in own["entries"]:
+                        m = by_n.get(e2["n"])
+                        if m and ms_norm(m["name"]) != ms_norm(e2["name"]):
+                            notes.append(f"Key on p{pn} disagrees with key on p{key_page} at item {e2['n']}: "
+                                         f"'{e2['name']}' vs '{m['name']}'")
+                arts = [r for r in runs if re.search(r"ARTWORK\s*REF", r["t"], re.I)]
+                titles = ms_view_titles(runs)
+                pairs = []                             # artwork ref under a bubble whose entry is 'see elevations for graphics'
+                for bi, b in enumerate(bub):
+                    if not GENERIC_KEY_RE.search(by_n[b["n"]]["desc"]):
+                        continue
+                    for ai, a in enumerate(arts):
+                        dx = abs((a["x0"] + a["x1"]) / 2 - b["cx"])
+                        dy = a["y0"] - b["cy"]
+                        if dx < 220 and 0 < dy < 650:
+                            pairs.append((dx + 0.15 * dy, bi, ai))
+                assigned, taken = {}, set()
+                for _, bi, ai in sorted(pairs):
+                    if bi not in assigned and ai not in taken:
+                        assigned[bi] = ai
+                        taken.add(ai)
+                for bi, b in enumerate(bub):
+                    art = ""
+                    if bi in assigned:
+                        a = arts[assigned[bi]]
+                        art = re.sub(r"(?i)^artwork\s*ref:?\s*", "", a["t"]).strip()
+                        art = re.sub(r"\s+", "", art) if "_" in art else art
+                        drop.append((pn, (a["x0"] - 4, a["y0"] - 30, a["x1"] + 4, a["y1"] + 14)))
+                    hits.append({"loose": b.get("loose", False), "n": b["n"], "page": pn, "cx": b["cx"], "cy": b["cy"], "d": b["d"], "art": art,
+                                 "view": ms_view_title(runs, (b["cx"], b["cy"]), titles), "dw": dw, "dh": dh,
+                                 "box": b["box"], "dwg": page_info.get(pn, {}).get("dwg", ""),
+                                 "title": page_info.get(pn, {}).get("title", "")})
+            finally:
+                pg.close()
+    finally:
+        doc.close()
+    drop.append((key_page, key_rect))
+    notes = list(dict.fromkeys(notes))
+
+    rows, snips = [], {}
+    doc = pdfium.PdfDocument(pdf_bytes)
+    pcache = {}
+
+    def getpage(n):
+        if n not in pcache:
+            pcache[n] = doc[n - 1]
+        return pcache[n]
+
+    def snippet(h):
+        pg = getpage(h["page"])
+        hw, hh = wpct * h["dw"], hpct * h["dw"]
+        scale = max(0.4, min(3.0, 1000.0 / (2 * hw)))
+        return {"kind": "elevation", "page": h["page"], "sheet": h["dwg"], "view": h["view"] or h["title"][:40],
+                "label": f"elevation p{h['page']} {h['dwg']} {h['view']}".strip(),
+                "png": crop_png(pg, (h["cx"], h["cy"]), hw, hh, scale, [h["box"]])}
+
+    def position(hs):
+        c = Counter(h["view"] or f"p{h['page']}" for h in hs)
+        return "; ".join(f"{v} x{n}" if n > 1 else v for v, n in c.items())
+
+    for e in entries:
+        hs = sorted([h for h in hits if h["n"] == e["n"]], key=lambda h: (h["page"], h["cy"], h["cx"]))
+        base_issues = []
+        if re.search(r"\bTB[CS]\b|TO BE CONFIRMED|SITE SIZED|SIZE TO BE", e["text"], re.I):
+            base_issues.append("size/details TBC")
+        if re.search(r"artwork supplied by|by marketing|by M&S", e["text"], re.I):
+            base_issues.append("artwork by M&S")
+        groups = [(None, hs)]
+        if hs and GENERIC_KEY_RE.search(e["desc"]) and any(h["art"] for h in hs):
+            g = defaultdict(list)
+            for h in hs:
+                g[h["art"] or ""].append(h)
+            groups = list(g.items())
+        for gi, (art, ghs) in enumerate(groups, 1):
+            code = f"K{e['n']:02d}" + (f".{gi}" if len(groups) > 1 else "")
+            issues = list(base_issues)
+            if not hs:
+                issues.append("in the signage key but no numbered circle found on the selected sheets")
+            if art == "" and len(groups) > 1:
+                issues.append("artwork ref not found next to this sign")
+            if any(h["loose"] for h in ghs):
+                issues.append(f"{sum(1 for h in ghs if h['loose'])} circle(s) read from the number only - check")
+            per_sheet = Counter(h["page"] for h in ghs)
+            qty = max(per_sheet.values()) if per_sheet else 0
+            if len(per_sheet) > 1 and len(set(per_sheet.values())) > 1:
+                issues.append("count differs between sheets (" + ", ".join(f"p{p}: {n}" for p, n in sorted(per_sheet.items()))
+                              + ") - check")
+            r = {"level": "-", "code": code, "desc": e["name"] + (f" - {art}" if art else ""), "qty": qty,
+                 "mod": f"Key {e['n']}" + (f"; Art {art}" if art else ""),
+                 "sched_page": ghs[0]["page"] if ghs else key_page,
+                 "size_name": ms_size_from_text(e["desc"]), "ffl_name": "",
+                 "position": position(ghs) if ghs else "",
+                 "plan_check": (f"{len(ghs)} numbered circle(s) on " + ", ".join(f"p{p}" for p in sorted(per_sheet)))
+                 if ghs else "none found",
+                 "check": "; ".join(issues),
+                 "pages": ", ".join(sorted({f"p{h['page']} {h['dwg']}".strip() for h in ghs})) + f"; key p{key_page}",
+                 "spec": e["desc"], "key": f"-|{code}"}
+            rows.append(r)
+            snips[r["key"]] = [snippet(ghs[0])] if (ghs and incl_elev) else []
+    for pg in pcache.values():
+        pg.close()
+    doc.close()
+
+    # text callouts that are not part of the key (external elevations, door artwork ...)
+    if extra_pages:
+        base = analyse_ms(pdf_bytes, tuple(sorted(extra_pages)), wpct, hpct, incl_plan, incl_elev,
+                          tuple((p, tuple(b)) for p, b in drop))
+        keep_re = re.compile(r"ARTWORK\s*REF|ILLUMINATED|\bLED\b|VINYL|ACRYLIC|TRAY|DIAMETER|\d+\s*MM|SUPPLIER", re.I)
+        kept = [r for r in base["rows"] if keep_re.search(r["desc"])]
+        for r in kept:
+            r["check"] = ("text callout, not in signage key; " + r["check"]).strip("; ")
+        rows += kept
+        snips.update({k: v for k, v in base["snips"].items() if k in {r["key"] for r in kept}})
+
+    warnings = []
+    missing = [e for e in entries if not any(h["n"] == e["n"] for h in hits)]
+    if missing:
+        warnings.append("Key items with no numbered circle on the selected sheets: "
+                        + ", ".join(f"{e['n']} {e['name']}" for e in missing[:12]) + (" ..." if len(missing) > 12 else ""))
+    return {"rows": rows, "snips": snips, "unmatched": [], "notes": notes, "warnings": warnings,
+            "pages": scan["pages"], "schedule_pages": [key_page], "fallback": False, "hits": hits,
+            "selected": sorted(set(apply_pages) | set(extra_pages)), "key_entries": entries}
+
+
+analyse_ms_key = st.cache_data(show_spinner="Building M&S schedule from the signage key...")(_analyse_ms_key)
+
+
+# --------------------------------------------------------------------------------------
+# M&S visual sweep (optional, needs an API key): reads rendered tiles of the elevations and reports every
+# key sign it can SEE - including signs drawn as artwork with no number and no callout (e.g. a FLOWER SHOP
+# sign that is just white lettering on a wall). The vector pass above only finds what is numbered or labelled.
+# --------------------------------------------------------------------------------------
+SWEEP_PROMPT = """This is a crop (tile) of a store signage elevation drawing. Below is the SIGNAGE KEY for the store.
+
+{key}
+
+Report every sign from this key that is physically drawn in THIS tile, whether or not it has a numbered circle beside it.
+Match by what the sign says or looks like (its lettering, shape, illumination) and by its numbered circle when it has one.
+Also report anything that clearly looks like a sign (lettering, graphic panel, roundel) but matches nothing in the key.
+Do NOT report: dimensions, grid-line circles, finish tags like WF:04, shelving, products, wall or floor finishes, red clouds.
+Return JSON only, no other text:
+{{"signs":[{{"key_no":<int or null>,"seen_text":"<wording on the sign>","circle_number":<int or null>,
+"x_pct":<0-100>,"y_pct":<0-100>,"confidence":"high"|"medium"|"low"}}]}}
+Use key_no null for signs not in the key. x_pct / y_pct are the centre of the sign within this tile (0,0 = top-left).
+Only report what is clearly visible. If you are unsure whether something is a sign, leave it out."""
+
+
+def sweep_tiles(region, tw=1100.0, th=780.0, ov=110.0):
+    x0, y0, x1, y1 = region
+    xs, ys = [], []
+    x = x0
+    while x < x1 - 40:
+        xs.append(x)
+        x += tw - ov
+    y = y0
+    while y < y1 - 40:
+        ys.append(y)
+        y += th - ov
+    return [(a, b, min(a + tw, x1), min(b + th, y1)) for b in ys for a in xs]
+
+
+def _sweep_read(client, model, jpg: bytes, key_text: str):
+    msg = client.messages.create(
+        model=model, max_tokens=1800,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(jpg).decode()}},
+            {"type": "text", "text": SWEEP_PROMPT.format(key=key_text)}]}])
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    a, b = text.find("{"), text.rfind("}")
+    if a < 0 or b < 0:
+        return []
+    try:
+        return json.loads(text[a:b + 1]).get("signs", [])
+    except Exception:
+        return []
+
+
+def ms_visual_sweep(client, model, pdf_bytes, page_no, entries, region, progress=None, scale=1.6, reader=None):
+    """{"seen": [...], "unmatched": [...], "tiles": n}. `reader(jpg, key_text)` can be injected for testing."""
+    key_text = "\n".join(f"{e['n']}: {e['name']} - {e['desc'][:110]}" for e in entries)
+    doc = pdfium.PdfDocument(pdf_bytes)
+    seen, unmatched = [], []
+    tiles = sweep_tiles(region)
+    try:
+        pg = doc[page_no - 1]
+        for ti, box in enumerate(tiles, 1):
+            im = crop_image(pg, box, scale)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=82)
+            try:
+                signs = (reader or (lambda j, k: _sweep_read(client, model, j, k)))(buf.getvalue(), key_text)
+            except Exception as e:
+                signs = []
+                unmatched.append({"page": page_no, "key_no": None, "text": f"tile {ti} failed: {e}",
+                                  "x": box[0], "y": box[1], "conf": "", "circle": None})
+            tw_, th_ = box[2] - box[0], box[3] - box[1]
+            for s_ in signs:
+                try:
+                    x = box[0] + float(s_.get("x_pct", 50)) / 100 * tw_
+                    y = box[1] + float(s_.get("y_pct", 50)) / 100 * th_
+                except Exception:
+                    continue
+                rec = {"page": page_no, "key_no": s_.get("key_no"), "text": str(s_.get("seen_text") or ""),
+                       "x": x, "y": y, "conf": s_.get("confidence", ""), "circle": s_.get("circle_number")}
+                (seen if isinstance(rec["key_no"], int) else unmatched).append(rec)
+            if progress:
+                progress(ti / len(tiles))
+        pg.close()
+    finally:
+        doc.close()
+    out = []                                       # overlapping tiles see the same sign twice - merge close detections
+    for r in sorted(seen, key=lambda r: (r["key_no"], r["y"], r["x"])):
+        if not any(o["key_no"] == r["key_no"] and math.hypot(o["x"] - r["x"], o["y"] - r["y"]) < 170 for o in out):
+            out.append(r)
+    uo = []
+    for r in unmatched:
+        if not any(math.hypot(o["x"] - r["x"], o["y"] - r["y"]) < 170 and o["text"].lower() == r["text"].lower() for o in uo):
+            uo.append(r)
+    return {"seen": out, "unmatched": uo, "tiles": len(tiles)}
+
+
+def merge_sweep(res, sweep, pdf_bytes, wpct, hpct):
+    """Fold visual-sweep results into a copy of the key-driven result. Never overwrites circle counts."""
+    res = {**res, "rows": [dict(r) for r in res["rows"]], "snips": dict(res["snips"]), "warnings": list(res["warnings"])}
+    seen = defaultdict(list)
+    for r in sweep["seen"]:
+        seen[r["key_no"]].append(r)
+    doc = pdfium.PdfDocument(pdf_bytes)
+    titles = {}
+    try:
+        for r in res["rows"]:
+            m = re.fullmatch(r"K(\d+)", r["code"])
+            if not m:
+                continue
+            vs = seen.get(int(m.group(1)), [])
+            if not vs:
+                continue
+            if r["qty"] == 0:
+                r["qty"] = len(vs)
+                bits = []
+                for v in vs:
+                    if v["page"] not in titles:
+                        pg = doc[v["page"] - 1]
+                        titles[v["page"]] = ms_view_titles(page_runs(pg)[0])
+                        pg.close()
+                    bits.append(ms_view_title(None, (v["x"], v["y"]), titles[v["page"]]) or f"p{v['page']}")
+                r["position"] = "; ".join(f"{k} x{c}" if c > 1 else k for k, c in Counter(bits).items())
+                r["plan_check"] = "visual sweep only"
+                r["check"] = ("seen by visual sweep only - no numbered circle or callout on the drawing, confirm; "
+                              + r["check"]).strip("; ")
+                r["mod"] = r["mod"] + "; visual"
+                pg = doc[vs[0]["page"] - 1]
+                tf, dw, dh = geom(pg)
+                hw, hh = wpct * dw, hpct * dw
+                scale = max(0.4, min(3.0, 1000.0 / (2 * hw)))
+                box = (vs[0]["x"] - 14, vs[0]["y"] - 14, vs[0]["x"] + 14, vs[0]["y"] + 14)
+                res["snips"][r["key"]] = [{"kind": "elevation", "page": vs[0]["page"], "sheet": "", "view": "",
+                                           "label": f"visual sweep p{vs[0]['page']}",
+                                           "png": crop_png(pg, (vs[0]["x"], vs[0]["y"]), hw, hh, scale, [box])}]
+                pg.close()
+            elif len(vs) > r["qty"]:
+                r["check"] = (f"visual sweep sees {len(vs)}, circles give {r['qty']} - check; " + r["check"]).strip("; ")
+    finally:
+        doc.close()
+    if sweep["unmatched"]:
+        res["warnings"].append(f"Visual sweep: {len(sweep['unmatched'])} sign-like item(s) that match nothing in the key.")
+    res["sweep_unmatched"] = sweep["unmatched"]
+    return res
 
 
 # --------------------------------------------------------------------------------------
@@ -1159,6 +1627,9 @@ def ms_mode():
 
     pages = scan["pages"]
     auto = [p["page"] for p in pages if p["type"] in ("plan", "elevation") and p["callouts"]]
+    ndup = sum(1 for p in pages if p["type"] == "duplicate")
+    if ndup:
+        st.info(f"{ndup} page(s) repeat an earlier sheet exactly (the pack looks bound twice) and are ignored, so nothing is counted twice.")
     by_page = {p["page"]: p for p in pages}
     with st.expander(f"Pages being read ({len(auto)} auto-selected) - change if a sign sheet was missed or a wrong one included"):
         sel = st.multiselect(
@@ -1167,14 +1638,73 @@ def ms_mode():
     if not sel:
         st.warning("Pick at least one page.")
         return
+    ks = ms_keyscan(pdf_bytes)
+    use_key = False
+    if ks:
+        key_page = max(ks, key=lambda p: len(ks[p]["entries"]))
+        use_key = st.checkbox(f"Use the signage key on p{key_page} ({len(ks[key_page]['entries'])} sign types) - recommended",
+                              value=True, help="Every sign in the key gets a row, found by its numbered circle on the elevations.")
     try:
-        res = analyse_ms(pdf_bytes, tuple(sorted(sel)), wpct, hpct, incl_plan, incl_elev)
+        if use_key:
+            with st.expander("Sheets whose numbered circles refer to the key"):
+                apply_pages = st.multiselect(
+                    "Sheets", [p["page"] for p in pages if p["type"] != "error"], default=sorted(ks), key="ms_apply",
+                    format_func=lambda n: f"p{n} | {by_page[n]['dwg'] or '-'} | {by_page[n]['title'] or '(no title found)'}")
+            if not apply_pages:
+                st.warning("Pick at least one sheet.")
+                return
+            res = analyse_ms_key(pdf_bytes, key_page, tuple(sorted(apply_pages)), wpct, hpct, incl_plan, incl_elev,
+                                 tuple(sorted(sel)))
+            if api_key:
+                with st.expander("Visual sweep - finds signs that have no number or label on the drawing", expanded=False):
+                    sw_pages = st.multiselect("Sheets to sweep", apply_pages, default=[key_page], key="ms_sweep_pages",
+                                              format_func=lambda n: f"p{n} {by_page[n]['title'][:50]}")
+                    skey = f"{file_id}|{model}|{tuple(sw_pages)}"
+                    store = st.session_state.setdefault("sweeps", {})
+                    st.caption("Reads the drawing as an image, tile by tile, and lists every key sign it can see. "
+                               "Anything it adds is flagged 'visual sweep only' - always check the snippet.")
+                    if st.button("Run visual sweep", key="ms_sweep_go"):
+                        import anthropic
+                        client = anthropic.Anthropic(api_key=api_key)
+                        bar = st.progress(0.0, text="Sweeping the drawings...")
+                        acc = {"seen": [], "unmatched": [], "tiles": 0}
+                        d_ = pdfium.PdfDocument(pdf_bytes)
+                        for k_, pn in enumerate(sw_pages):
+                            pg_ = d_[pn - 1]
+                            _, dw_, dh_ = geom(pg_)
+                            pg_.close()
+                            part = ms_visual_sweep(client, model, pdf_bytes, pn, ks[key_page]["entries"],
+                                                   (0, 0, 0.66 * dw_, 0.96 * dh_),
+                                                   progress=lambda f, k_=k_: bar.progress((k_ + f) / len(sw_pages)))
+                            for kk in ("seen", "unmatched"):
+                                acc[kk] += part[kk]
+                            acc["tiles"] += part["tiles"]
+                        d_.close()
+                        bar.empty()
+                        store[skey] = acc
+                        st.rerun()
+                    if skey in store:
+                        res = merge_sweep(res, store[skey], pdf_bytes, wpct, hpct)
+                        st.success(f"Sweep done: {len(store[skey]['seen'])} key signs seen across {store[skey]['tiles']} tiles.")
+                        if res.get("sweep_unmatched"):
+                            st.markdown("**Sign-like items that match nothing in the key**")
+                            st.dataframe(pd.DataFrame(res["sweep_unmatched"])[["page", "text", "conf"]],
+                                         use_container_width=True, hide_index=True)
+            else:
+                st.caption("Add an Anthropic API key in the sidebar to switch on the visual sweep for signs with no number or label.")
+        else:
+            res = analyse_ms(pdf_bytes, tuple(sorted(sel)), wpct, hpct, incl_plan, incl_elev)
     except Exception as e:
         st.error(f"Couldn't build the M&S schedule: {e}")
         return
-    st.caption("M&S doesn't use sign codes, so each sign gets an ID (B / GF / FF + number; EL = only seen on an elevation). "
-               "The M&S UPC / artwork / drawing reference is in the 'MOD / Ref' column. Quantity is the number of callouts "
-               "counted on the signage plans across all floors unless a callout states a number.")
+    if use_key:
+        st.caption("Sign IDs here are the M&S signage key numbers (K03 = key item 3). Quantity is the number of numbered circles "
+                   "on the elevations (the highest count on any one sheet, so a sign drawn on two sheets isn't doubled). "
+                   "Anything flagged in the Check column is worth a look.")
+    else:
+        st.caption("M&S doesn't use sign codes, so each sign gets an ID (B / GF / FF + number; EL = only seen on an elevation). "
+                   "The M&S UPC / artwork / drawing reference is in the 'MOD / Ref' column. Quantity is the number of callouts "
+                   "counted on the signage plans across all floors unless a callout states a number.")
     show_results(res, up.name, file_id, "ms", api_key, model)
 
 
