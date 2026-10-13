@@ -1722,7 +1722,7 @@ GT_LAYOUT_RE = re.compile(r"elevation|key plan|plan\b|^sign [a-z]$|manifestation
 def read_manual_page(page, pno):
     runs, dw, dh = page_runs(page)
     d = next((r for r in runs if r["t"].upper().startswith("DESCRIPTION:")), None)
-    out = {"page": pno, "dwg": "", "title": "", "qty": [], "lin": [], "flags": [], "revs": [], "text": "", "nums": [], "is_sheet": d is not None}
+    out = {"page": pno, "dwg": "", "title": "", "qty": [], "lin": [], "flags": [], "revs": [], "text": "", "nums": [], "ffl": [], "is_sheet": d is not None}
     if d is None:
         out["text"] = " ".join(r["t"] for r in runs)[:400]
         return out
@@ -1757,6 +1757,8 @@ def read_manual_page(page, pno):
     for mm in GT_QTY_RE.finditer(qtxt):
         out["qty"].append(int(mm.group(1)))
     out["lin"] = [float(x) for x in GT_LIN_RE.findall(txt)]
+    out["ffl"] = sorted({int(x) for x in re.findall(r"(\d{3,4})\s*mm\s*(?:AFFL|FFL|A\.F\.F\.L)", qtxt, re.I)} |
+                        {int(x) for x in re.findall(r"(?:AFFL|FFL)[^\d|]{0,12}(\d{3,4})\s*mm", qtxt, re.I)})
     out["flags"] = sorted({f.upper() for f in GT_FLAG_RE.findall(txt)})
     for r in body:
         for n in re.findall(r"(?<![\d.])(\d{2,5})(?:\s*mm)?(?![\d.])", r["t"]):
@@ -1795,10 +1797,10 @@ def manual_signs(pages):
             continue
         key = (p["dwg"], p["title"].lower())
         s = signs.setdefault(key, {"title": p["title"], "dwg": p["dwg"], "pages": [], "qty": [], "lin": [], "flags": [],
-                                   "revs": [], "text": "", "nums": [], "spec": False})
+                                   "revs": [], "text": "", "nums": [], "ffl": [], "spec": False})
         s["pages"].append(p["page"])
         s["qty"] += p["qty"]; s["lin"] += p["lin"]; s["flags"] = sorted(set(s["flags"]) | set(p["flags"]))
-        s["revs"] += p["revs"]; s["text"] += " | " + p["text"]; s["nums"] += p["nums"]; s["spec"] |= spec
+        s["ffl"] = sorted(set(s["ffl"]) | set(p["ffl"])); s["revs"] += p["revs"]; s["text"] += " | " + p["text"]; s["nums"] += p["nums"]; s["spec"] |= spec
     out = [s for s in signs.values() if s["spec"] or s["qty"]]
     layout += [p for s in signs.values() if not (s["spec"] or s["qty"]) for p in []]
     return out, layout
@@ -2005,8 +2007,11 @@ def ck_check(signs, rows, retailer):
                                  "Pack page": ppg, "Status": "OK" if ok else "Check",
                                  "Note": "" if ok else "Quantities differ - check the sheet and the pack callouts"})
             elif s["lin"] and conf >= 0.7:
+                ok = any(abs(pq - q) < 0.5 for q in s["lin"])
                 rows_out.append({**base, "Check": "Quantity", "Manual says": " / ".join(f"{q:g} linear m" for q in s["lin"]),
-                                 "Pack says": str(pq) + " callout(s)", "Pack page": ppg, "Status": "OK", "Note": "Measured in linear metres - not compared"})
+                                 "Pack says": f"{pq}" + (" (schedule count)" if tk else " callout(s)"), "Pack page": ppg,
+                                 "Status": "OK" if (ok or not tk) else "Check",
+                                 "Note": "" if ok else ("Linear metres differ from the pack count" if tk else "Measured in linear metres - not compared")})
             psz = sorted({n for r in pk for n in _ck_sizes(("" if "(name)" in (r["size_name"] or "") else (r["size_name"] or "")) + " " + r["desc"])})
             if psz and conf >= 0.7:
                 msz = set(s["nums"]) | _ck_sizes(s["text"])
@@ -2015,6 +2020,17 @@ def ck_check(signs, rows, retailer):
                                  "Pack says": ", ".join(f"{n}mm" for n in psz), "Pack page": ppg,
                                  "Status": "OK" if not miss else "Check",
                                  "Note": "" if not miss else ", ".join(f"{n}mm" for n in miss) + " in the pack is not on your sheet"})
+            if s.get("ffl"):
+                pf = sorted({int(x) for r in pk for x in re.findall(r"(\d{3,4})\s*mm\s*(?:AFFL|FFL)", (r.get("ffl_name") or "") + " " + r["desc"], re.I)})
+                if pf:
+                    ok = any(f in s["ffl"] for f in pf)
+                    rows_out.append({**base, "Check": "FFL height", "Manual says": ", ".join(f"{f}mm" for f in s["ffl"]),
+                                     "Pack says": ", ".join(f"{f}mm" for f in pf), "Pack page": ppg, "Status": "OK" if ok else "Check",
+                                     "Note": "" if ok else "Fixing height differs from the pack"})
+                else:
+                    rows_out.append({**base, "Check": "FFL height", "Manual says": ", ".join(f"{f}mm" for f in s["ffl"]),
+                                     "Pack says": "no readable height in the pack text", "Pack page": ppg, "Status": "OK",
+                                     "Note": "Not compared automatically - check against the pack drawing in the view below"})
             fl = []
             for r in pk:
                 for kw in ("TBC", "not yet defined", "existing", "retained", "differs", "number only", "visual sweep", "artwork by M&S"):
@@ -2323,7 +2339,7 @@ def manual_checker(retailer):
 
     t1, t2, t3 = st.tabs(["Checks", "In the pack, not in your manual", "Manual sheets read"])
     with t1:
-        show = st.multiselect("Show", ["OK", "Check"], default=["Check"], key=f"mc_filter_{retailer}")
+        show = st.multiselect("Show", ["OK", "Check"], default=["OK", "Check"], key=f"mc_filter_{retailer}")
         only_issue = st.checkbox("Hide the 'In the pack' OK lines for signs that are otherwise fine", value=False, key=f"mc_hide_{retailer}")
         view = df[df["Status"].isin(show)].reset_index(drop=True)
         if only_issue:
