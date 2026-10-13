@@ -1766,7 +1766,10 @@ def read_manual_page(page, pno):
     return out
 
 
-def _read_manual(pdf_bytes):
+CK_VER = "2026-10-13c"   # bump when the readers change: Streamlit only hashes a cached function's own body, so stale results survive edits to helpers
+
+
+def _read_manual(pdf_bytes, ver=""):
     pdf = pdfium.PdfDocument(pdf_bytes)
     pages = []
     try:
@@ -1800,7 +1803,7 @@ def manual_signs(pages):
                                    "revs": [], "text": "", "nums": [], "ffl": [], "spec": False})
         s["pages"].append(p["page"])
         s["qty"] += p["qty"]; s["lin"] += p["lin"]; s["flags"] = sorted(set(s["flags"]) | set(p["flags"]))
-        s["ffl"] = sorted(set(s["ffl"]) | set(p["ffl"])); s["revs"] += p["revs"]; s["text"] += " | " + p["text"]; s["nums"] += p["nums"]; s["spec"] |= spec
+        s["ffl"] = sorted(set(s["ffl"]) | set(p.get("ffl", []))); s["revs"] += p["revs"]; s["text"] += " | " + p["text"]; s["nums"] += p["nums"]; s["spec"] |= spec
     out = [s for s in signs.values() if s["spec"] or s["qty"]]
     layout += [p for s in signs.values() if not (s["spec"] or s["qty"]) for p in []]
     return out, layout
@@ -1905,7 +1908,7 @@ def ck_match(signs, rows, thr=0.5):
 
 
 # ---- Shared: read a pack into schedule rows ---------------------------------------------------
-def _ck_pack(pdf_bytes, retailer, snippets):
+def _ck_pack(pdf_bytes, retailer, snippets, ver=""):
     if retailer == "TK Maxx":
         res = analyse(pdf_bytes, 1, snippets, 220, 160, 150, 110, 100)
     else:
@@ -2160,7 +2163,7 @@ def _rv_pixdiff(old_bytes, new_bytes, pairs, scale=0.3, min_frac=0.00006):
     return out
 
 
-def _ck_revision(old_bytes, new_bytes, retailer, with_pixels=True):
+def _ck_revision(old_bytes, new_bytes, retailer, with_pixels=True, ver=""):
     po, pn = _ck_pack(old_bytes, retailer, False), _ck_pack(new_bytes, retailer, False)
     changes = rv_diff_rows(po["rows"], pn["rows"], retailer)
     sheets_old, sheets_new = {}, {}
@@ -2311,9 +2314,9 @@ def manual_checker(retailer):
         return
     mb, pb = mf.getvalue(), pf.getvalue()
     try:
-        pages = read_manual(mb)
+        pages = read_manual(mb, CK_VER)
         signs, layout = manual_signs(pages)
-        pack = ck_pack(pb, retailer, True)
+        pack = ck_pack(pb, retailer, True, CK_VER)
     except Exception as e:
         st.error(f"Couldn't read one of those files: {e}")
         return
@@ -2411,14 +2414,14 @@ def revision_checker(retailer):
         st.success("These two files are identical - nothing has changed.")
         return
     try:
-        rv = ck_revision(ob, nb, retailer, vis)
+        rv = ck_revision(ob, nb, retailer, vis, CK_VER)
     except Exception as e:
         st.error(f"Couldn't compare those files: {e}")
         return
     signs = []
     if mf:
         try:
-            signs, _ = manual_signs(read_manual(mf.getvalue()))
+            signs, _ = manual_signs(read_manual(mf.getvalue(), CK_VER))
         except Exception as e:
             st.warning(f"Couldn't read the manual, so manual impact isn't shown: {e}")
     idf = ck_idf(signs, rv["old_rows"] + rv["new_rows"]) if signs else None
