@@ -1178,9 +1178,219 @@ def ms_mode():
     show_results(res, up.name, file_id, "ms", api_key, model)
 
 
-st.title("Store Signage Schedule Extractor")
-mode = st.radio("Retailer", ["TK Maxx", "M&S"], horizontal=True, label_visibility="collapsed")
-if mode == "TK Maxx":
-    tk_mode()
+# --------------------------------------------------------------------------------------
+# MOCK-UPS: Manual Checker + Revision Checker (screens are real, results are sample data)
+# --------------------------------------------------------------------------------------
+def _demo_png(text, size=(560, 300), tint=(238, 240, 244)):
+    im = Image.new("RGB", size, tint)
+    d = ImageDraw.Draw(im)
+    d.rectangle([2, 2, size[0] - 3, size[1] - 3], outline=(170, 175, 185), width=2)
+    for k, line in enumerate(text.split("\n")):
+        d.text((18, 18 + 18 * k), line, fill=(90, 95, 105))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+MANUAL_DEMO = pd.DataFrame([
+    # sign, check, manual says, pack says, status, note
+    ("Try on hanging signage", "Quantity", "3 No. required", "3 (Ground x2, First x1)", "OK", ""),
+    ("Try on hanging signage", "Size", "275mm high letters", "Plan: 275mm / Elevation: 225mm", "Check",
+     "Pack disagrees with itself - confirm with M&S before production"),
+    ("Fitting rooms Pay here", "Quantity", "3 No. sets", "3 (Ground x2, First x1)", "OK", ""),
+    ("Lift lettering", "Quantity", "2 No. required", "2 (Ground x1, First x1)", "OK", ""),
+    ("Lift lettering", "FFL", "2400mm", "2400mm AFFL", "OK", ""),
+    ("Slat signage", "Quantity", "7 No.", "7", "OK", ""),
+    ("Door vinyl graphics", "Quantity", "11 doors (sheets 1-2)", "10 door callouts on plans", "Check",
+     "One door in the manual has no callout in the pack"),
+    ("Quiet room (BoH)", "Present in manual", "Not in manual", "Artwork ref QUIET-ROOM.ai on basement plan", "Missing",
+     "Add a manual page or confirm it's out of scope"),
+    ("Chicken door", "Present in pack", "Manual page DJ-0926-164", "Not found on any signage plan", "Check",
+     "Manual item with no matching pack callout"),
+    ("Till vinyls - belted tills", "Quantity", "4 No. sets", "4", "OK", ""),
+], columns=["Sign", "Check", "Manual says", "Pack says", "Status", "Note"])
+
+REVISION_DEMO = pd.DataFrame([
+    # change, sign, was, now, where, manual impact
+    ("Added", "Weigh before you pay", "-", "2 No. scales panels, matt black vinyl", "Till details p4", "New manual page needed"),
+    ("Artwork amended", "Percy door vinyl", "Percy", "Percy centralised", "Door graphics p3", "Update drawing, bump rev"),
+    ("Colour changed", "Freshness & Flavour vinyl", "Matt black", "Matt white", "Food hall elev. p9", "Update spec + artwork"),
+    ("Construction changed", "Quality Seal roundel", "Standard build", "Flush inlaid", "Food hall elev. p9", "Update section detail"),
+    ("Position changed", "Bakery & Coffee linear sign", "Previous elevation", "Amended elevation/position", "Bakery elev. p7", "Update position view"),
+    ("Quantity changed", "Till vinyls - self-serve", "3 sets", "4 sets", "Till details p2", "Update 'No. required'"),
+    ("Removed", "Toilet pictograms (directory totem)", "On artwork", "Removed", "Totem artwork p5", "Update totem artwork"),
+], columns=["Change", "Sign", "Was", "Now", "Where", "Manual impact"])
+
+REV_HISTORY_DEMO = pd.DataFrame([
+    ("A", "29.07.26", "Percy added"),
+    ("B", "03.08.26", "Background added to Percy"),
+    ("C", "26.08.26", "Door artworks added"),
+    ("D", "28.08.26", "Artwork amended"),
+    ("E", "23.09.26", "Percy centralised"),
+], columns=["Rev", "Date", "Note"])
+
+
+
+def build_report_pdf(title, subtitle, metrics, df, status_col=None, note="", sample=False) -> bytes:
+    """Shareable A4-landscape PDF: title, summary figures, then the table (status cells colour-coded)."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm,
+                            topMargin=12 * mm, bottomMargin=14 * mm, title=title)
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=18, alignment=0, spaceAfter=2)
+    sub = ParagraphStyle("sub", parent=ss["Normal"], fontSize=9, textColor=colors.HexColor("#555555"))
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontSize=8, leading=10)
+    head = ParagraphStyle("head", parent=cell, textColor=colors.white, fontName="Helvetica-Bold")
+    story = [Paragraph(escape(title), h1), Paragraph(escape(subtitle), sub), Spacer(1, 4 * mm)]
+    if sample:
+        story += [Paragraph("<b>SAMPLE DATA - mock-up only, not a real check.</b>", ParagraphStyle(
+            "s", parent=cell, textColor=colors.HexColor("#b00020"), fontSize=9)), Spacer(1, 3 * mm)]
+    if metrics:
+        mt = Table([[Paragraph(f"<b>{escape(str(v))}</b><br/>{escape(k)}", ParagraphStyle(
+            "m", parent=cell, fontSize=10, leading=13, alignment=1)) for k, v in metrics]], hAlign="LEFT")
+        mt.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f5f7")),
+                                ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+        story += [mt, Spacer(1, 5 * mm)]
+    cols = list(df.columns)
+    data = [[Paragraph(escape(str(c)), head) for c in cols]]
+    for _, r in df.iterrows():
+        data.append([Paragraph(escape(str(r[c])), cell) for c in cols])
+    avail = landscape(A4)[0] - 24 * mm
+    widths = [avail / len(cols)] * len(cols)
+    tbl = Table(data, colWidths=widths, repeatRows=1)
+    style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f3a4a")),
+             ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fb")])]
+    if status_col in cols:
+        k = cols.index(status_col)
+        pal = {"OK": "#d7f0dd", "Check": "#fff0c2", "Missing": "#f9d3d3"}
+        for n, (_, r) in enumerate(df.iterrows(), start=1):
+            if str(r[status_col]) in pal:
+                style.append(("BACKGROUND", (k, n), (k, n), colors.HexColor(pal[str(r[status_col])])))
+    tbl.setStyle(TableStyle(style))
+    story.append(tbl)
+    if note:
+        story += [Spacer(1, 4 * mm), Paragraph(escape(note), sub)]
+
+    def footer(canvas, d):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(12 * mm, 7 * mm, title)
+        canvas.drawRightString(landscape(A4)[0] - 12 * mm, 7 * mm, f"Page {d.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+def _mock_banner(text):
+    st.warning("MOCK-UP: " + text)
+
+
+def manual_checker(retailer):
+    st.subheader(f"Manual Checker - {retailer}")
+    st.caption("Checks your finished manual against the pack the client supplied, and flags anything that doesn't agree.")
+    _mock_banner("the screen is real but the results below are sample data. Uploading files doesn't run the check yet.")
+    u1, u2 = st.columns(2)
+    u1.file_uploader("Your manual (PDF)", type=["pdf"], key=f"mc_manual_{retailer}")
+    u2.file_uploader(f"{retailer} pack from the client (PDF)", type=["pdf"], key=f"mc_pack_{retailer}")
+    if not st.toggle("Show sample results", value=True, key=f"mc_demo_{retailer}"):
+        return
+
+    df = MANUAL_DEMO
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Checks run", len(df))
+    c2.metric("OK", int((df["Status"] == "OK").sum()))
+    c3.metric("To check", int((df["Status"] == "Check").sum()))
+    c4.metric("Missing", int((df["Status"] == "Missing").sum()))
+
+    show = st.multiselect("Show", ["OK", "Check", "Missing"], default=["Check", "Missing"], key=f"mc_filter_{retailer}")
+    view = df[df["Status"].isin(show)].reset_index(drop=True)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    if not view.empty:
+        i = st.selectbox("Look at one", range(len(view)),
+                         format_func=lambda k: f"{view.loc[k, 'Sign']} - {view.loc[k, 'Check']} ({view.loc[k, 'Status']})",
+                         key=f"mc_pick_{retailer}")
+        r = view.iloc[i]
+        st.markdown(f"**{r['Sign']}** - {r['Check']}")
+        a, b = st.columns(2)
+        a.image(_demo_png(f"YOUR MANUAL (sample)\n\n{r['Sign']}\n{r['Manual says']}"), caption="Your manual page")
+        b.image(_demo_png(f"CLIENT PACK (sample)\n\n{r['Sign']}\n{r['Pack says']}"), caption="Pack drawing / callout")
+        if r["Note"]:
+            st.info(r["Note"])
+    pdf = build_report_pdf(f"Manual check - {retailer}", "Your manual checked against the client pack",
+                           [("Checks run", len(df)), ("OK", int((df["Status"] == "OK").sum())),
+                            ("To check", int((df["Status"] == "Check").sum())),
+                            ("Missing", int((df["Status"] == "Missing").sum()))],
+                           df, status_col="Status", sample=True)
+    st.download_button("Download check sheet (PDF)", pdf, "manual_check_sample.pdf", "application/pdf",
+                       key=f"mc_dl_{retailer}")
+
+
+def revision_checker(retailer):
+    st.subheader(f"Revision Checker - {retailer}")
+    st.caption("Compares the pack you've worked from with revised drawings, and lists what changed and what it means for your manual.")
+    _mock_banner("the screen is real but the results below are sample data (taken from the revision notes in your Geetee manual). "
+                 "Uploading files doesn't run the comparison yet.")
+    u1, u2 = st.columns(2)
+    u1.file_uploader("Pack you've worked from (PDF)", type=["pdf"], key=f"rc_old_{retailer}")
+    u2.file_uploader("Revised drawings (PDF)", type=["pdf"], key=f"rc_new_{retailer}")
+    if not st.toggle("Show sample results", value=True, key=f"rc_demo_{retailer}"):
+        return
+
+    df = REVISION_DEMO
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Changes", len(df))
+    c2.metric("Added", int((df["Change"] == "Added").sum()))
+    c3.metric("Removed", int((df["Change"] == "Removed").sum()))
+    c4.metric("Amended", int((~df["Change"].isin(["Added", "Removed"])).sum()))
+
+    kinds = sorted(df["Change"].unique())
+    pick = st.multiselect("Change types", kinds, default=kinds, key=f"rc_filter_{retailer}")
+    view = df[df["Change"].isin(pick)].reset_index(drop=True)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    if not view.empty:
+        i = st.selectbox("Look at one", range(len(view)),
+                         format_func=lambda k: f"{view.loc[k, 'Sign']} - {view.loc[k, 'Change']}", key=f"rc_pick_{retailer}")
+        r = view.iloc[i]
+        a, b = st.columns(2)
+        a.image(_demo_png(f"BEFORE (sample)\n\n{r['Sign']}\n{r['Was']}"), caption="Old pack")
+        b.image(_demo_png(f"AFTER (sample)\n\n{r['Sign']}\n{r['Now']}", tint=(240, 246, 240)), caption="Revised drawing")
+        st.info(f"Manual impact: {r['Manual impact']}  |  Where: {r['Where']}")
+    with st.expander("Revision history read from the title blocks"):
+        st.dataframe(REV_HISTORY_DEMO, use_container_width=True, hide_index=True)
+    pdf = build_report_pdf(f"Revision check - {retailer}", "Revised drawings compared with the pack worked from",
+                           [("Changes", len(df)), ("Added", int((df["Change"] == "Added").sum())),
+                            ("Removed", int((df["Change"] == "Removed").sum())),
+                            ("Amended", int((~df["Change"].isin(["Added", "Removed"])).sum()))],
+                           df, sample=True,
+                           note="Revision history: " + "; ".join(f"Rev {a} {b} - {c}" for a, b, c in REV_HISTORY_DEMO.itertuples(index=False)))
+    st.download_button("Download change list (PDF)", pdf, "revision_changes_sample.pdf", "application/pdf",
+                       key=f"rc_dl_{retailer}")
+
+
+st.title("Store Signage Tools")
+tool = st.radio("Tool", ["Signage Extractor", "Manual Checker", "Revision Checker"], horizontal=True,
+                key="tool", label_visibility="collapsed")
+retailer = st.radio("Retailer", ["TK Maxx", "M&S"], horizontal=True, key="retailer", label_visibility="collapsed")
+if tool == "Signage Extractor":
+    if retailer == "TK Maxx":
+        tk_mode()
+    else:
+        ms_mode()
+elif tool == "Manual Checker":
+    manual_checker(retailer)
 else:
-    ms_mode()
+    revision_checker(retailer)
