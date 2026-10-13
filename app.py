@@ -224,6 +224,7 @@ def nearest_view_title(runs, hit) -> str:
 # TK Maxx analysis
 # --------------------------------------------------------------------------------------
 def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
+    _reader_version = "2026-10-13-rowre"   # changes the cache key of this function so results stored before the schedule-row fix are not reused
     rows, unmatched, notes, page_rows, warnings = [], [], [], [], []
     doc = pdfium.PdfDocument(pdf_bytes)
     n_pages = len(doc)
@@ -1910,16 +1911,16 @@ def ck_match(signs, rows, thr=0.5):
 # ---- Shared: read a pack into schedule rows ---------------------------------------------------
 def _ck_pack(pdf_bytes, retailer, snippets, ver=""):
     if retailer == "TK Maxx":
-        res = analyse(pdf_bytes, 1, snippets, 220, 160, 150, 110, 100)
+        res = _analyse(pdf_bytes, 1, snippets, 220, 160, 150, 110, 100)
     else:
         scan = ms_scan(pdf_bytes)
         auto = tuple(sorted(p["page"] for p in scan["pages"] if p["type"] in ("plan", "elevation") and p["callouts"]))
         ks = ms_keyscan(pdf_bytes)
         if ks:
             key_page = max(ks, key=lambda p: len(ks[p]["entries"]))
-            res = analyse_ms_key(pdf_bytes, key_page, tuple(sorted(ks)), 0.09, 0.065, snippets, snippets, auto)
+            res = _analyse_ms_key(pdf_bytes, key_page, tuple(sorted(ks)), 0.09, 0.065, snippets, snippets, auto)
         else:
-            res = analyse_ms(pdf_bytes, auto, 0.09, 0.065, snippets, snippets)
+            res = _analyse_ms(pdf_bytes, auto, 0.09, 0.065, snippets, snippets)
     rows = []
     for r in res["rows"]:
         r = dict(r)
