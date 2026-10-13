@@ -1955,6 +1955,14 @@ def tk_code_ok(pack_code, manual_code):
     return _tk_base(pack_code) == _tk_base(manual_code)
 
 
+def tk_code_same(pack_code, manual_code):
+    """Strict version for the side-by-side table: same item AND same variant letters (hyphens ignored), unless one side leaves the suffix off."""
+    if not tk_code_ok(pack_code, manual_code):
+        return False
+    a, b = pack_code.upper()[len(_tk_base(pack_code)):].replace("-", ""), manual_code.upper()[len(_tk_base(manual_code)):].replace("-", "")
+    return a == b or not a or not b
+
+
 def ck_check(signs, rows, retailer):
     """Check each manual sign against the pack rows. Returns (checks, sign_summaries, pack_only)."""
     live = [r for r in rows if r.get("qty", 0) > 0]
@@ -2059,11 +2067,51 @@ def ck_check(signs, rows, retailer):
         checks += rows_out
         last = max(s["revs"], key=lambda r: (r["rev"] or ""), default=None) if s["revs"] else None
         summ.append({"sign": s["title"], "dwg": s["dwg"], "pages": mpg, "status": "Check" if any(r["Status"] == "Check" for r in rows_out) else "OK",
-                     "n_pack": len(pk), "rev": (f"Rev {last['rev']} {last['desc']}" if last else "")})
+                     "n_pack": len(pk), "pk": pk, "rev": (f"Rev {last['rev']} {last['desc']}" if last else "")})
     pack_only = [{"Sign": r["desc"][:110], "Code": r["code"], "Qty": r["qty"], "Where": (r["position"] or r["level"])[:70],
                   "Pack page": f"p{r['sched_page']}" if r["sched_page"] else "", "Status": "Missing",
                   "Note": (r["check"] or "")[:110], "_key": r.get("key") or f"{r.get('level', '-')}|{r['code']}"} for r in left]
     return checks, summ, pack_only
+
+
+_CMP_COLS = r"white|grey|gray|black|orange|silver|red|green|blue|clear|opal|frosted|brass|gold|yellow|pink|purple|cream|brown"
+
+
+def ck_compare_table(signs, summ, reads=None, retailer="TK Maxx"):
+    """One row per sign: code / colour / height, yours vs the pack's, with a match flag. reads = drawing-check results (optional)."""
+    reads = reads or {}
+    out = []
+    for s, sm in zip(signs, summ):
+        pk = sm.get("pk", [])
+        rd = reads.get(s["title"], {})
+        man_codes = sorted(set(TK_CODE_RE.findall((s["title"] + " " + s["text"]).upper()))) if retailer == "TK Maxx" else []
+        pack_codes = sorted({r["code"] for r in pk})
+        if retailer == "TK Maxx":
+            if man_codes and pack_codes:
+                cm = "Yes" if all(any(tk_code_same(p, m) for p in pack_codes) for m in man_codes) else "No"
+            else:
+                cm = "?"
+        else:
+            cm = "n/a"
+        # colour
+        mcol = sorted({w.lower().replace("gray", "grey") for w in re.findall(_CMP_COLS, s["text"], re.I)})
+        pcol = sorted({w.lower().replace("gray", "grey") for r in pk for w in re.findall(_CMP_COLS, r["desc"], re.I)})
+        if rd:
+            mcol = sorted(set(mcol) | set(rd["man"]["colours"])) if not rd["man"]["colours"] else rd["man"]["colours"]
+            pcol = sorted(set(pcol) | set(rd["pack"]["colours"]))
+        colm = "?" if not (mcol and pcol) else ("Yes" if set(mcol) & set(pcol) else "No")
+        # height: letter height / fixing height / stated sizes
+        pH = sorted({int(n) for r in pk for n in re.findall(r"(\d{2,4})\s*mm", (r.get("size_name") or "") + " " + r["desc"])})
+        mH = sorted(set(s.get("ffl", [])))
+        if rd:
+            mH = sorted(set(mH) | set(rd["man"]["letter"]) | set(rd["man"]["ffl"]))
+            pH = sorted(set(pH) | set(rd["pack"]["letter"]) | set(rd["pack"]["ffl"]))
+        hm = "?" if not (mH and pH) else ("Yes" if set(mH) & set(pH) else "No")
+        out.append({"Sign": s["title"], "Code - yours": ", ".join(man_codes) or "-", "Code - pack": ", ".join(pack_codes) or "-", "Code match": cm,
+                    "Colour - yours": ", ".join(mcol[:4]) or "-", "Colour - pack": ", ".join(pcol[:4]) or "-", "Colour match": colm,
+                    "Height - yours": ", ".join(f"{h}" for h in mH[:4]) or "-", "Height - pack": ", ".join(f"{h}" for h in pH[:4]) or "-", "Height match": hm,
+                    "Pages": ", ".join(f"p{p}" for p in s["pages"][:3])})
+    return out
 
 
 # ---- Revision Checker -------------------------------------------------------------------------
@@ -2225,7 +2273,7 @@ def ck_report_pdf(title, subtitle, metrics, sections, notes=(), status_cols=("St
                                 ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f5f7")),
                                 ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
         story += [mt, Spacer(1, 4 * mm)]
-    pal = {"OK": "#d7f0dd", "Check": "#fff0c2", "Missing": "#f9d3d3", "Added": "#d7f0dd", "Removed": "#f9d3d3"}
+    pal = {"OK": "#d7f0dd", "Check": "#fff0c2", "Missing": "#f9d3d3", "Added": "#d7f0dd", "Removed": "#f9d3d3", "Yes": "#d7f0dd", "No": "#f9d3d3", "?": "#fff0c2"}
     for k, (heading, df, widths) in enumerate(sections):
         if k:
             story.append(Spacer(1, 4 * mm))
@@ -2380,6 +2428,7 @@ def _ck_render_page_png(pdf_bytes, pno, scale=1.6):
 def ck_draw_check(client, model, signs, checks, pack, manual_bytes, only=None, reader=None, progress=None):
     """Run the drawing read for the chosen signs. Returns [{sign, item, manual, pack, status, note}]."""
     out = []
+    reads_out = {}
     by_sign = {}
     for r in checks:
         by_sign.setdefault(r["Sign"], r)
@@ -2403,12 +2452,13 @@ def ck_draw_check(client, model, signs, checks, pack, manual_bytes, only=None, r
         except Exception as e:
             out.append({"sign": s["title"], "item": "-", "manual": "", "pack": f"could not read: {e}"[:90], "status": "Not read", "note": ""})
             continue
+        reads_out[s["title"]] = {"man": man, "pack": pk}
         rows = ck_draw_compare(man, pk)
         if not rows:
             out.append({"sign": s["title"], "item": "-", "manual": "", "pack": "nothing readable on either drawing", "status": "Not read", "note": ""})
         for it, a, b, st_, note in rows:
             out.append({"sign": s["title"], "item": it, "manual": a, "pack": b, "status": st_, "note": note})
-    return out
+    return out, reads_out
 
 
 # ---- Screens: Manual Checker + Revision Checker ----------------------------------------------
@@ -2469,7 +2519,19 @@ def manual_checker(retailer):
     st.caption(f"Pack read in {'signage-key' if pack['mode'] == 'key' else 'callout'} mode: {len(pack['rows'])} rows. "
                f"{len(layout)} layout sheet(s) in your manual were skipped.")
 
-    t1, t2, t3 = st.tabs(["Checks", "In the pack, not in your manual", "Manual sheets read"])
+    dkey = f"mc_draw_{retailer}_{hashlib.md5(mb + pb).hexdigest()}"
+    reads = st.session_state.get(dkey + "_reads", {})
+    cmp_rows = ck_compare_table(signs, summ, reads, retailer)
+    cmp_df = pd.DataFrame(cmp_rows)
+    t0, t1, t2, t3 = st.tabs(["Side by side", "Checks", "In the pack, not in your manual", "Manual sheets read"])
+    with t0:
+        st.caption("Yours vs the pack for each sign. 'Yes' = they agree, 'No' = they differ, '?' = one side couldn't be read from the text - "
+                   "run the Drawing check below to read it from the drawings. Heights are mm (fixing height and letter height).")
+        only_bad = st.checkbox("Only show signs with a 'No' or '?'", value=False, key=f"mc_cmp_bad_{retailer}")
+        vw = cmp_df
+        if only_bad:
+            vw = cmp_df[(cmp_df[["Code match", "Colour match", "Height match"]] != "Yes").any(axis=1)]
+        st.dataframe(vw, use_container_width=True, hide_index=True)
     with t1:
         show = st.multiselect("Show", ["OK", "Check"], default=["OK", "Check"], key=f"mc_filter_{retailer}")
         only_issue = st.checkbox("Hide the 'In the pack' OK lines for signs that are otherwise fine", value=False, key=f"mc_hide_{retailer}")
@@ -2502,7 +2564,6 @@ def manual_checker(retailer):
         if layout:
             st.caption("Skipped as layout: " + "; ".join(f"p{p['page']} {p['title']}" for p in layout))
 
-    dkey = f"mc_draw_{retailer}_{hashlib.md5(mb + pb).hexdigest()}"
     with st.expander("Drawing check - read heights, FFL, colour and wording from both drawings (uses the API)"):
         st.caption("Reads your sign sheet and the pack's elevation around each sign, then compares letter height, fixing height, overall size, colour "
                    "and wording. It is a prompt to look, not a verdict - open the sign in the viewer above to confirm by eye.")
@@ -2513,10 +2574,12 @@ def manual_checker(retailer):
         if st.button(f"Run drawing check on {len(pick)} sign(s)", key=f"mc_draw_go_{retailer}", disabled=not (dkey_api and pick)):
             import anthropic
             bar = st.progress(0.0)
-            res_d = ck_draw_check(anthropic.Anthropic(api_key=dkey_api), dmodel, signs, checks, pack, mb, set(pick),
+            res_d, reads_d = ck_draw_check(anthropic.Anthropic(api_key=dkey_api), dmodel, signs, checks, pack, mb, set(pick),
                                   progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
             bar.empty()
             st.session_state[dkey] = res_d
+            st.session_state[dkey + "_reads"] = reads_d
+            st.rerun()
         if not dkey_api:
             st.info("Set ANTHROPIC_API_KEY (or paste a key here) to run this.")
     draw = st.session_state.get(dkey)
@@ -2525,7 +2588,8 @@ def manual_checker(retailer):
         st.subheader("Drawing check")
         st.dataframe(ddf, use_container_width=True, hide_index=True)
 
-    sec = [("Checks needing attention", df[df["Status"] == "Check"].drop(columns=["Dwg"]), [40, 24, 52, 62, 16, None, 14, 14]),
+    sec = [("Yours vs the pack - code, colour, height", cmp_df, [38, 22, 22, 12, 22, 22, 15, 16, 16, 15, None]),
+           ("Checks needing attention", df[df["Status"] == "Check"].drop(columns=["Dwg"]), [40, 24, 52, 62, 16, None, 14, 14]),
            ("Pack items not covered by a manual sheet", po, [70, 20, 10, 50, 16, 16, None])]
     if draw:
         sec.append(("Drawing check (read from the drawings by the vision model - confirm by eye)", ddf[ddf["Status"] != "OK"], [40, 30, 50, 50, 16, None]))
@@ -2534,7 +2598,9 @@ def manual_checker(retailer):
                         [(h, d, w) for (h, d, w) in sec],
                         notes=["Signs are matched to the pack by name (and by code for TK Maxx), so a Check line may be a naming difference rather than a real error.",
                                "Quantities are compared to what your sheet states ('N No. required'); sheets that state none are not compared.",
-                               "Layout-only sheets (plans, elevations) in the manual are not treated as signs."])
+                               "Layout-only sheets (plans, elevations) in the manual are not treated as signs.",
+                               "Side-by-side table: Yes = agree, No = differ, ? = one side could not be read from the text."],
+                        status_cols=("Status", "Code match", "Colour match", "Height match"))
     d1, d2 = st.columns(2)
     d1.download_button("Download check sheet (PDF, A4 landscape)", pdf, "manual_check.pdf", "application/pdf", key=f"mc_dl_{retailer}")
     d2.download_button("Download checks (CSV)", df.to_csv(index=False).encode("utf-8-sig"), "manual_check.csv", "text/csv", key=f"mc_csv_{retailer}")
