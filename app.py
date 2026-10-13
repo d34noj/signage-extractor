@@ -1709,107 +1709,509 @@ def ms_mode():
 
 
 # --------------------------------------------------------------------------------------
-# MOCK-UPS: Manual Checker + Revision Checker (screens are real, results are sample data)
+# Manual Checker + Revision Checker
 # --------------------------------------------------------------------------------------
-def _demo_png(text, size=(560, 300), tint=(238, 240, 244)):
-    im = Image.new("RGB", size, tint)
-    d = ImageDraw.Draw(im)
-    d.rectangle([2, 2, size[0] - 3, size[1] - 3], outline=(170, 175, 185), width=2)
-    for k, line in enumerate(text.split("\n")):
-        d.text((18, 18 + 18 * k), line, fill=(90, 95, 105))
-    buf = io.BytesIO()
-    im.save(buf, format="PNG")
-    return buf.getvalue()
+# ---- Manual reading (Geetee Signs sheets) ----------------------------------------------------
+GT_DWG_RE = re.compile(r"\b[A-Z]{2}-\d{4}-\d{2,4}\b")
+GT_QTY_RE = re.compile(r"(\d+)\s*(?:no\.?|off|nr\.?)\s*(?:full\s+)?(sets?|each|pairs?|panels?)?\s*(?:required|req\.?|total)?", re.I)
+GT_LIN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*linear\s*m", re.I)
+GT_FLAG_RE = re.compile(r"\b(ON HOLD|TBC|TO BE CONFIRMED|ARTWORK (?:REQUIRED|TBC|TO FOLLOW)|AWAITING|NOT REQUIRED|REMOVED|DELETED|OMITTED)\b", re.I)
+GT_LAYOUT_RE = re.compile(r"elevation|key plan|plan\b|^sign [a-z]$|manifestation|opening hours|legal signage|cover|index|contents", re.I)
 
 
-MANUAL_DEMO = pd.DataFrame([
-    # sign, check, manual says, pack says, status, note
-    ("Try on hanging signage", "Quantity", "3 No. required", "3 (Ground x2, First x1)", "OK", ""),
-    ("Try on hanging signage", "Size", "275mm high letters", "Plan: 275mm / Elevation: 225mm", "Check",
-     "Pack disagrees with itself - confirm with M&S before production"),
-    ("Fitting rooms Pay here", "Quantity", "3 No. sets", "3 (Ground x2, First x1)", "OK", ""),
-    ("Lift lettering", "Quantity", "2 No. required", "2 (Ground x1, First x1)", "OK", ""),
-    ("Lift lettering", "FFL", "2400mm", "2400mm AFFL", "OK", ""),
-    ("Slat signage", "Quantity", "7 No.", "7", "OK", ""),
-    ("Door vinyl graphics", "Quantity", "11 doors (sheets 1-2)", "10 door callouts on plans", "Check",
-     "One door in the manual has no callout in the pack"),
-    ("Quiet room (BoH)", "Present in manual", "Not in manual", "Artwork ref QUIET-ROOM.ai on basement plan", "Missing",
-     "Add a manual page or confirm it's out of scope"),
-    ("Chicken door", "Present in pack", "Manual page DJ-0926-164", "Not found on any signage plan", "Check",
-     "Manual item with no matching pack callout"),
-    ("Till vinyls - belted tills", "Quantity", "4 No. sets", "4", "OK", ""),
-], columns=["Sign", "Check", "Manual says", "Pack says", "Status", "Note"])
+def read_manual_page(page, pno):
+    runs, dw, dh = page_runs(page)
+    d = next((r for r in runs if r["t"].upper().startswith("DESCRIPTION:")), None)
+    out = {"page": pno, "dwg": "", "title": "", "qty": [], "lin": [], "flags": [], "revs": [], "text": "", "nums": [], "is_sheet": d is not None}
+    if d is None:
+        out["text"] = " ".join(r["t"] for r in runs)[:400]
+        return out
+    # title: runs right of the DESCRIPTION label, in the same block row
+    tl = [r for r in runs if 500 <= r["x0"] < 680 and d["y0"] - 4 <= r["y0"] <= d["y0"] + 26 and r["h"] > 7
+          and not r["t"].upper().endswith(":") and not re.fullmatch(r"\d\d\.\d\d\.\d{2,4}|n/a", r["t"].strip(), re.I)
+          and "geetee" not in r["t"].lower()]
+    tl.sort(key=lambda r: (round(r["y0"] / 3), r["x0"]))
+    t = " ".join(r["t"] for r in tl)
+    t = re.split(r"\s*This drawing", t)[0].strip()
+    out["title"] = t
+    m = [r for r in runs if GT_DWG_RE.fullmatch(r["t"].strip())]
+    if m:
+        out["dwg"] = m[0]["t"].strip()
+    # revision rows (rev table sits right of x=850 in the title block)
+    rt = [r for r in runs if 850 <= r["x0"] <= 1000 and r["y0"] > d["y0"] - 60]
+    dates = [r for r in rt if re.fullmatch(r"\d\d\.\d\d\.\d\d", r["t"]) and not r["t"].startswith("00.00")]
+    for dt in sorted(dates, key=lambda r: r["y0"]):
+        row = [r for r in rt if abs(r["y0"] - dt["y0"]) < 4 and r["x0"] > dt["x1"]]
+        row.sort(key=lambda r: r["x0"])
+        letter = next((r["t"] for r in rt if abs(r["y0"] - dt["y0"]) < 6 and r["x0"] < dt["x0"] and len(r["t"]) == 1), "")
+        txt = [r["t"] for r in row if not re.fullmatch(r"X+", r["t"])]
+        by = txt[0] if txt and len(txt[0]) <= 3 else ""
+        desc = " ".join(txt[1:] if by else txt)
+        out["revs"].append({"rev": letter, "date": dt["t"], "by": by, "desc": desc})
+    # body = everything outside the title block strip
+    body = [r for r in runs if not (r["y0"] > d["y0"] - 62 and r["x0"] > 480) and r["t"] != t]
+    body = [r for r in body if not r["t"].startswith("This drawing") and not r["t"].startswith("All measurements")]
+    txt = " | ".join(r["t"] for r in sorted(body, key=lambda r: (round(r["y0"] / 6), r["x0"])))
+    out["text"] = txt
+    for mm in GT_QTY_RE.finditer(txt):
+        out["qty"].append(int(mm.group(1)))
+    out["lin"] = [float(x) for x in GT_LIN_RE.findall(txt)]
+    out["flags"] = sorted({f.upper() for f in GT_FLAG_RE.findall(txt)})
+    for r in body:
+        for n in re.findall(r"(?<![\d.])(\d{2,5})(?:\s*mm)?(?![\d.])", r["t"]):
+            out["nums"].append(int(n))
+    return out
 
-REVISION_DEMO = pd.DataFrame([
-    # change, sign, was, now, where, manual impact
-    ("Added", "Weigh before you pay", "-", "2 No. scales panels, matt black vinyl", "Till details p4", "New manual page needed"),
-    ("Artwork amended", "Percy door vinyl", "Percy", "Percy centralised", "Door graphics p3", "Update drawing, bump rev"),
-    ("Colour changed", "Freshness & Flavour vinyl", "Matt black", "Matt white", "Food hall elev. p9", "Update spec + artwork"),
-    ("Construction changed", "Quality Seal roundel", "Standard build", "Flush inlaid", "Food hall elev. p9", "Update section detail"),
-    ("Position changed", "Bakery & Coffee linear sign", "Previous elevation", "Amended elevation/position", "Bakery elev. p7", "Update position view"),
-    ("Quantity changed", "Till vinyls - self-serve", "3 sets", "4 sets", "Till details p2", "Update 'No. required'"),
-    ("Removed", "Toilet pictograms (directory totem)", "On artwork", "Removed", "Totem artwork p5", "Update totem artwork"),
-], columns=["Change", "Sign", "Was", "Now", "Where", "Manual impact"])
 
-REV_HISTORY_DEMO = pd.DataFrame([
-    ("A", "29.07.26", "Percy added"),
-    ("B", "03.08.26", "Background added to Percy"),
-    ("C", "26.08.26", "Door artworks added"),
-    ("D", "28.08.26", "Artwork amended"),
-    ("E", "23.09.26", "Percy centralised"),
-], columns=["Rev", "Date", "Note"])
+def _read_manual(pdf_bytes):
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    pages = []
+    try:
+        for i in range(len(pdf)):
+            pg = pdf[i]
+            try:
+                pages.append(read_manual_page(pg, i + 1))
+            finally:
+                pg.close()
+    finally:
+        pdf.close()
+    return pages
 
 
+read_manual = st.cache_data(show_spinner="Reading your manual...")(_read_manual)
 
-def build_report_pdf(title, subtitle, metrics, df, status_col=None, note="", sample=False) -> bytes:
-    """Shareable A4-landscape PDF: title, summary figures, then the table (status cells colour-coded)."""
+
+def manual_signs(pages):
+    """Group sheets into signs by (drawing no, title). Layout-only sheets are kept apart."""
+    signs, layout = {}, []
+    for p in pages:
+        if not p["is_sheet"] or not re.search(r"[A-Za-z]{3,}", p["title"] or ""):
+            continue
+        spec = bool(re.search(r"scale 1:|specification|vinyl|letters|required|fixed|mm", p["text"], re.I))
+        has_q = bool(p["qty"] or p["lin"])
+        if GT_LAYOUT_RE.search(p["title"]) and not has_q:
+            layout.append(p)
+            continue
+        key = (p["dwg"], p["title"].lower())
+        s = signs.setdefault(key, {"title": p["title"], "dwg": p["dwg"], "pages": [], "qty": [], "lin": [], "flags": [],
+                                   "revs": [], "text": "", "nums": [], "spec": False})
+        s["pages"].append(p["page"])
+        s["qty"] += p["qty"]; s["lin"] += p["lin"]; s["flags"] = sorted(set(s["flags"]) | set(p["flags"]))
+        s["revs"] += p["revs"]; s["text"] += " | " + p["text"]; s["nums"] += p["nums"]; s["spec"] |= spec
+    out = [s for s in signs.values() if s["spec"] or s["qty"]]
+    layout += [p for s in signs.values() if not (s["spec"] or s["qty"]) for p in []]
+    return out, layout
+
+
+# ---- Matching manual signs to pack rows -------------------------------------------------------
+_CK_STOP = set("a an the and or of to for in on at with by from is are be as no mm m x sign signs signage vinyl vinyls graphic graphics "
+               "illuminated non wall mounted hanging fixed required req sets set each off new existing see refer artwork detail details "
+               "applied internal internally external supply install fit fitted type size high wide long centres floor level ground first "
+               "one two three four five six tbc edit text message ref".split())
+_CK_SYN = {"toilets": "toilet", "wc": "toilet", "wcs": "toilet", "loo": "toilet", "bakers": "baker", "bakery": "baker", "baking": "bake",
+           "tills": "till", "checkout": "till", "colleagues": "colleague", "customers": "customer", "doors": "door", "mirrors": "mirror",
+           "lifts": "lift", "slats": "slat", "totems": "totem", "directory": "directory", "directories": "directory", "boh": "boh",
+           "backofhouse": "boh", "pay": "pay", "payment": "pay", "fitting": "fitting", "rooms": "room", "windows": "window",
+           "letters": "letter", "lettering": "letter", "manifestations": "manifestation", "roundel": "roundel", "roundels": "roundel"}
+
+
+def _ck_stem(w):
+    w = _CK_SYN.get(w, w)
+    if len(w) > 4 and w.endswith("ing") and w not in _CK_SYN:
+        w = w[:-3]
+    elif len(w) > 4 and w.endswith("ed"):
+        w = w[:-2]
+    if len(w) > 3 and w.endswith("s") and w not in _CK_SYN:
+        w = w[:-1]
+    if len(w) > 4 and w.endswith("er") and w not in ("number", "water", "corner"):
+        w = w[:-2]
+    return w
+
+
+_CK_STOP |= {_ck_stem(w) for w in set(_CK_STOP)} | set("bespoke affl front back bulkhead high hang hung colour color grey gray black white matt "
+                                                       "gloss acrylic aluminium frame paint finish cut flat fret thick vinyls applied internal".split())
+
+
+def ck_tokens(s, keep_generic=False):
+    out = set()
+    s = re.sub(r"\S+\.(?:jpe?g|png|ai|pdf|eps|tif+|svg)\b", " ", (s or ""), flags=re.I)
+    for w in re.findall(r"[a-z0-9]+", s.lower().replace("&", " and ")):
+        w = _ck_stem(w)
+        if not keep_generic and (w in _CK_STOP or w.isdigit() or len(w) < 2 or (re.search(r"\d", w) and not re.fullmatch(r"[a-z]{1,3}\d+", w))):
+            continue
+        out.add(w)
+    return out
+
+
+def ck_idf(signs, rows):
+    import math
+    docs = [ck_tokens(s["title"]) for s in signs] + [ck_tokens(r["desc"]) for r in rows]
+    n = max(len(docs), 1)
+    df = {}
+    for d in docs:
+        for w in d:
+            df[w] = df.get(w, 0) + 1
+    return {w: math.log(1 + n / c) for w, c in df.items()}
+
+
+def ck_score(sign, row, idf=None):
+    """0..1 - how well a pack row's description fits a manual sign (idf-weighted word overlap)."""
+    tt = ck_tokens(sign["title"]) or ck_tokens(sign["title"], True)
+    rt = ck_tokens(row["desc"]) or ck_tokens(row["desc"], True)
+    if not tt or not rt:
+        return 0.0
+    wt = (lambda w: idf.get(w, 1.0)) if idf else (lambda w: 1.0)
+    shared = tt & rt
+    if not shared:
+        return 0.0
+    base = sum(map(wt, shared)) / min(sum(map(wt, tt)), sum(map(wt, rt)))
+    if base < 1.0 and sign.get("text"):
+        bt = ck_tokens(sign["text"])
+        extra = (rt - shared) & bt
+        if extra:
+            base = min(1.0, base + 0.1 * min(len(extra), 2))
+    return round(min(base, 1.0), 3)
+
+
+def ck_match(signs, rows, thr=0.5):
+    """Each pack row goes to its best-scoring sign(s) (ties kept). Returns {sign index: [rows]}, [unmatched rows]."""
+    idf = ck_idf(signs, rows)
+    got = {i: [] for i in range(len(signs))}
+    left = []
+    for r in rows:
+        if r.get("qty", 0) <= 0:
+            continue
+        sc = [(ck_score(s, r, idf), i) for i, s in enumerate(signs)]
+        best = max(sc, default=(0, -1))
+        if best[0] >= thr:
+            for v, i in sc:
+                if v >= best[0] - 1e-9:
+                    got[i].append(r)
+        else:
+            left.append(r)
+    return got, left
+
+
+# ---- Shared: read a pack into schedule rows ---------------------------------------------------
+def _ck_pack(pdf_bytes, retailer, snippets):
+    if retailer == "TK Maxx":
+        res = analyse(pdf_bytes, 1, snippets, 220, 160, 150, 110, 100)
+    else:
+        scan = ms_scan(pdf_bytes)
+        auto = tuple(sorted(p["page"] for p in scan["pages"] if p["type"] in ("plan", "elevation") and p["callouts"]))
+        ks = ms_keyscan(pdf_bytes)
+        if ks:
+            key_page = max(ks, key=lambda p: len(ks[p]["entries"]))
+            res = analyse_ms_key(pdf_bytes, key_page, tuple(sorted(ks)), 0.09, 0.065, snippets, snippets, auto)
+        else:
+            res = analyse_ms(pdf_bytes, auto, 0.09, 0.065, snippets, snippets)
+    rows = []
+    for r in res["rows"]:
+        r = dict(r)
+        r.setdefault("level", "-"); r.setdefault("position", ""); r.setdefault("check", ""); r.setdefault("size_name", "")
+        r.setdefault("pages", ""); r.setdefault("desc", ""); r.setdefault("qty", 0); r.setdefault("code", "")
+        r["key"] = r.get("key") or f"{r['level']}|{r['code']}"
+        m = re.search(r"\bp(\d+)", r["pages"] or "")
+        r["sched_page"] = int(m.group(1)) if m else r.get("sched_page", 0)
+        rows.append(r)
+    return {"rows": rows, "snips": res.get("snips", {}), "pages": res.get("pages", []), "warnings": res.get("warnings", []),
+            "mode": "key" if (retailer != "TK Maxx" and res.get("key_entries")) else "callout"}
+
+
+ck_pack = st.cache_data(show_spinner="Reading the pack...")(_ck_pack)
+
+
+# ---- Manual Checker ---------------------------------------------------------------------------
+def _ck_sizes(text):
+    return {int(n) for n in re.findall(r"(?<![\d.])(\d{2,4})\s*mm", text or "", re.I)}
+
+
+def ck_check(signs, rows, retailer):
+    """Check each manual sign against the pack rows. Returns (checks, sign_summaries, pack_only)."""
+    live = [r for r in rows if r.get("qty", 0) > 0]
+    got, left = {i: [] for i in range(len(signs))}, []
+    idf = ck_idf(signs, live)
+    for r in live:
+        hit = None
+        if retailer == "TK Maxx" and r["code"]:
+            cre = re.compile(r"(?<![A-Z0-9_-])" + re.escape(r["code"]) + r"(?![A-Z0-9_-])", re.I)
+            hit = [i for i, s in enumerate(signs) if cre.search(s["title"] + " " + s["text"])]
+        if hit:
+            for i in hit:
+                got[i].append((r, 1.0))
+            continue
+        sc = [(ck_score(s, r, idf), i) for i, s in enumerate(signs)]
+        best = max(sc, default=(0, -1))
+        if best[0] >= 0.5:
+            for v, i in sc:
+                if v >= best[0] - 1e-9:
+                    got[i].append((r, v))
+        else:
+            left.append(r)
+    checks, summ = [], []
+    for i, s in enumerate(signs):
+        rs = got[i]
+        pk = [r if r.get("key") else {**r, "key": f"{r.get('level', '-')}|{r['code']}"} for r, _ in rs]
+        conf = min((v for _, v in rs), default=0)
+        mpg = ", ".join(f"p{p}" for p in s["pages"])
+        name = s["title"] + (f"  [{s['dwg']}]" if s["dwg"] else "")
+        ppg = ", ".join(sorted({f"p{r['sched_page']}" for r in pk if r["sched_page"]}, key=lambda x: int(x[1:])))
+        base = {"Sign": s["title"], "Dwg": s["dwg"], "Manual page": mpg, "_keys": [r["key"] for r in pk if r.get("key")], "_mp": s["pages"][0]}
+        rows_out = []
+        if not pk:
+            rows_out.append({**base, "Check": "In the pack", "Manual says": "Manual sheet " + mpg, "Pack says": "No matching callout / key item",
+                             "Pack page": "", "Status": "Check",
+                             "Note": "Sign is in your manual but not found in the pack - confirm it is still wanted, or the pack uses a different name"})
+        else:
+            names = "; ".join(f"{r['code']} {r['desc'][:45]}" for r in pk[:4]) + (f" (+{len(pk) - 4} more)" if len(pk) > 4 else "")
+            rows_out.append({**base, "Check": "In the pack", "Manual says": s["title"], "Pack says": names, "Pack page": ppg,
+                             "Status": "OK" if conf >= 0.7 else "Check",
+                             "Note": "" if conf >= 0.7 else "Loose name match - confirm it is the same sign (quantity and size not compared)"})
+            mq = sorted({q for q in s["qty"] if q})
+            pq = sum(r["qty"] for r in pk)
+            if conf < 0.7:
+                mq, psz_skip = [], True
+            if mq:
+                ok = pq in mq or pq == sum(mq) or pq == sum(sorted(set(mq)))
+                rows_out.append({**base, "Check": "Quantity", "Manual says": " / ".join(f"{q} No." for q in mq), "Pack says": str(pq),
+                                 "Pack page": ppg, "Status": "OK" if ok else "Check",
+                                 "Note": "" if ok else "Quantities differ - check the sheet and the pack callouts"})
+            elif s["lin"] and conf >= 0.7:
+                rows_out.append({**base, "Check": "Quantity", "Manual says": " / ".join(f"{q:g} linear m" for q in s["lin"]),
+                                 "Pack says": str(pq) + " callout(s)", "Pack page": ppg, "Status": "OK", "Note": "Measured in linear metres - not compared"})
+            psz = sorted({n for r in pk for n in _ck_sizes((r["size_name"] or "") + " " + r["desc"])})
+            if psz and conf >= 0.7:
+                msz = set(s["nums"]) | _ck_sizes(s["text"])
+                miss = [n for n in psz if n not in msz]
+                rows_out.append({**base, "Check": "Size", "Manual says": "sizes on sheet: " + (", ".join(str(n) for n in sorted(msz)[:8]) or "none read"),
+                                 "Pack says": ", ".join(f"{n}mm" for n in psz), "Pack page": ppg,
+                                 "Status": "OK" if not miss else "Check",
+                                 "Note": "" if not miss else ", ".join(f"{n}mm" for n in miss) + " in the pack is not on your sheet"})
+            fl = []
+            for r in pk:
+                for kw in ("TBC", "not yet defined", "existing", "retained", "differs", "number only", "visual sweep", "artwork by M&S"):
+                    if kw.lower() in r["check"].lower() and kw not in fl:
+                        fl.append(kw)
+            if fl:
+                rows_out.append({**base, "Check": "Pack flags", "Manual says": "", "Pack says": "; ".join(fl), "Pack page": ppg,
+                                 "Status": "Check", "Note": "The pack itself flags this sign as unsettled or non-standard"})
+        if s["flags"]:
+            rows_out.append({**base, "Check": "Manual notes", "Manual says": ", ".join(s["flags"]), "Pack says": "", "Pack page": "",
+                             "Status": "Check", "Note": "Your sheet carries a hold / TBC note"})
+        checks += rows_out
+        last = max(s["revs"], key=lambda r: (r["rev"] or ""), default=None) if s["revs"] else None
+        summ.append({"sign": s["title"], "dwg": s["dwg"], "pages": mpg, "status": "Check" if any(r["Status"] == "Check" for r in rows_out) else "OK",
+                     "n_pack": len(pk), "rev": (f"Rev {last['rev']} {last['desc']}" if last else "")})
+    pack_only = [{"Sign": r["desc"][:110], "Code": r["code"], "Qty": r["qty"], "Where": (r["position"] or r["level"])[:70],
+                  "Pack page": f"p{r['sched_page']}" if r["sched_page"] else "", "Status": "Missing",
+                  "Note": (r["check"] or "")[:110], "_key": r.get("key") or f"{r.get('level', '-')}|{r['code']}"} for r in left]
+    return checks, summ, pack_only
+
+
+# ---- Revision Checker -------------------------------------------------------------------------
+def _rv_norm(desc):
+    return " ".join(sorted(ck_tokens(desc, True)))
+
+
+def _rv_pos(p):
+    return sorted({re.sub(r"\s*x\d+\s*$", "", x).strip().lower() for x in (p or "").split(";") if x.strip()})
+
+
+def rv_diff_rows(old, new, retailer):
+    """Pair rows old<->new, return list of change dicts."""
+    import difflib
+    old = [r for r in old if r.get("qty", 0) > 0 or r.get("desc")]
+    new = [r for r in new if r.get("qty", 0) > 0 or r.get("desc")]
+    pairs, uo, un = [], list(range(len(old))), list(range(len(new)))
+
+    def take(fn, thr):
+        cand = []
+        for i in uo:
+            for j in un:
+                sc = fn(old[i], new[j])
+                if sc >= thr:
+                    cand.append((sc, i, j))
+        for sc, i, j in sorted(cand, reverse=True):
+            if i in uo and j in un:
+                uo.remove(i); un.remove(j); pairs.append((i, j, sc))
+    if retailer == "TK Maxx":
+        take(lambda a, b: 1.0 if a["code"] and a["code"] == b["code"] and a["level"] == b["level"] else 0.0, 1.0)
+    take(lambda a, b: 1.0 if _rv_norm(a["desc"]) == _rv_norm(b["desc"]) and a["level"] == b["level"] else 0.0, 1.0)
+    take(lambda a, b: 0.99 if _rv_norm(a["desc"]) == _rv_norm(b["desc"]) else 0.0, 0.99)
+    sim = lambda a, b: difflib.SequenceMatcher(None, a["desc"].lower(), b["desc"].lower()).ratio()
+    take(sim, 0.85)
+    take(sim, 0.6)
+    out = []
+    for i, j, sc in pairs:
+        a, b = old[i], new[j]
+        if a["qty"] != b["qty"]:
+            out.append(("Quantity changed", b, f"{a['qty']}", f"{b['qty']}", a, "Update the 'No. required' on the sheet"))
+        if _rv_pos(a["position"]) != _rv_pos(b["position"]) and (a["position"] or b["position"]):
+            out.append(("Position changed", b, a["position"][:80] or "-", b["position"][:80] or "-", a, "Update the position / elevation on the sheet"))
+        if (a["size_name"] or "") != (b["size_name"] or ""):
+            out.append(("Size changed", b, a["size_name"] or "-", b["size_name"] or "-", a, "Update dimensions and artwork"))
+        if re.sub(r"\s+", " ", a["desc"]).strip().lower() != re.sub(r"\s+", " ", b["desc"]).strip().lower():
+            out.append(("Wording changed", b, a["desc"][:110], b["desc"][:110], a, "Check spec / artwork against the new wording"))
+    for j in un:
+        b = new[j]
+        out.append(("Added", b, "-", f"{b['qty']} x {b['desc'][:100]}", None, "New manual sheet needed"))
+    for i in uo:
+        a = old[i]
+        out.append(("Removed", a, f"{a['qty']} x {a['desc'][:100]}", "-", a, "Remove / mark the manual sheet"))
+    return out
+
+
+def _rv_sheets(pack_bytes):
+    sc = ms_scan(pack_bytes)
+    return {p["page"]: p for p in sc["pages"] if p["type"] not in ("error", "duplicate")}
+
+
+def _rv_pixdiff(old_bytes, new_bytes, pairs, scale=0.3, min_frac=0.00006):
+    """pairs = [(old page, new page, label)]. Returns changed-page records with before/after PNG crops."""
+    import numpy as np
+    from PIL import ImageChops, ImageFilter
+    o, n = pdfium.PdfDocument(old_bytes), pdfium.PdfDocument(new_bytes)
+    out = []
+    try:
+        for po, pn, label in pairs:
+            a_pg, b_pg = o[po - 1], n[pn - 1]
+            try:
+                A = a_pg.render(scale=scale).to_pil().convert("L")
+                B = b_pg.render(scale=scale).to_pil().convert("L")
+                sized = abs(A.size[0] - B.size[0]) > 4 or abs(A.size[1] - B.size[1]) > 4
+                if sized:
+                    B = B.resize(A.size)
+                d = np.asarray(ImageChops.difference(A, B)) > 60
+                w = d.shape[1]
+                d[:, int(w * 0.88):] = False          # title-block strip (rev letters, dates) - not sign content
+                d = np.asarray(Image.fromarray((d * 255).astype("uint8")).filter(ImageFilter.MaxFilter(9))) > 0
+                frac = float(d.mean())
+                if frac < min_frac:
+                    continue
+                ys, xs = np.where(d)
+                x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+                pad = 60
+                bx = (max(0, x0 - pad) / scale, max(0, y0 - pad) / scale, min(w, x1 + pad) / scale, min(d.shape[0], y1 + pad) / scale)
+                for_big = 0.9 if (bx[2] - bx[0]) < 900 else 0.5
+                ia = crop_image(a_pg, bx, for_big).resize((int((bx[2] - bx[0]) * for_big), int((bx[3] - bx[1]) * for_big)))
+                bb = crop_image(b_pg, bx, for_big)
+                bufa, bufb = io.BytesIO(), io.BytesIO()
+                ia.save(bufa, "PNG"); bb.save(bufb, "PNG")
+                out.append({"label": label, "old": po, "new": pn, "frac": frac, "size_differs": sized,
+                            "before": bufa.getvalue(), "after": bufb.getvalue()})
+            finally:
+                a_pg.close(); b_pg.close()
+    finally:
+        o.close(); n.close()
+    return out
+
+
+def _ck_revision(old_bytes, new_bytes, retailer, with_pixels=True):
+    po, pn = _ck_pack(old_bytes, retailer, False), _ck_pack(new_bytes, retailer, False)
+    changes = rv_diff_rows(po["rows"], pn["rows"], retailer)
+    sheets_old, sheets_new = {}, {}
+    pages_old = {p["page"]: p for p in (po["pages"] or [])}
+    pages_new = {p["page"]: p for p in (pn["pages"] or [])}
+    kf = lambda p: (p.get("dwg") or "", "" if p.get("dwg") else (p.get("title") or "").lower())
+    so = {kf(p): p for p in pages_old.values() if p.get("type") not in ("error", "duplicate")}
+    sn = {kf(p): p for p in pages_new.values() if p.get("type") not in ("error", "duplicate")}
+    sheet_changes = []
+    for k, p in sn.items():
+        if k not in so:
+            sheet_changes.append({"Change": "Sheet added", "Sheet": f"{k[0]} {p.get('title','')}".strip(), "Old page": "-", "New page": f"p{p['page']}"})
+    for k, p in so.items():
+        if k not in sn:
+            sheet_changes.append({"Change": "Sheet removed", "Sheet": f"{k[0]} {p.get('title','')}".strip(), "Old page": f"p{p['page']}", "New page": "-"})
+    pix = []
+    if with_pixels and pages_old and pages_new:
+        pairs = []
+        for k, p in sn.items():
+            if k in so and p.get("type") in ("plan", "elevation") and so[k].get("type") in ("plan", "elevation"):
+                pairs.append((so[k]["page"], p["page"], f"{k[0]} {p.get('title','')}".strip()))
+        pix = _rv_pixdiff(old_bytes, new_bytes, pairs)
+        pix.sort(key=lambda r: -r["frac"])
+    return {"changes": changes, "sheets": sheet_changes, "pix": pix, "old_rows": po["rows"], "new_rows": pn["rows"],
+            "n_old": len(po["rows"]), "n_new": len(pn["rows"])}
+
+
+ck_revision = st.cache_data(show_spinner="Comparing the two packs...")(_ck_revision)
+
+
+# ---- A4 landscape report ----------------------------------------------------------------------
+def ck_report_pdf(title, subtitle, metrics, sections, notes=(), status_cols=("Status",), images=()):
+    """sections = [(heading, DataFrame, [col widths in mm or None])]; images = [(caption, before png, after png)]."""
     from xml.sax.saxutils import escape
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Image as RLImage, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm,
-                            topMargin=12 * mm, bottomMargin=14 * mm, title=title)
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm, topMargin=11 * mm,
+                            bottomMargin=13 * mm, title=title)
     ss = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=18, alignment=0, spaceAfter=2)
-    sub = ParagraphStyle("sub", parent=ss["Normal"], fontSize=9, textColor=colors.HexColor("#555555"))
-    cell = ParagraphStyle("cell", parent=ss["Normal"], fontSize=8, leading=10)
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=17, leading=20, alignment=0, spaceAfter=2)
+    sub = ParagraphStyle("sub", parent=ss["Normal"], fontSize=8.5, leading=11, textColor=colors.HexColor("#555555"))
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontSize=7.4, leading=9)
+    cellb = ParagraphStyle("cellb", parent=cell, fontName="Helvetica-Bold")
     head = ParagraphStyle("head", parent=cell, textColor=colors.white, fontName="Helvetica-Bold")
-    story = [Paragraph(escape(title), h1), Paragraph(escape(subtitle), sub), Spacer(1, 4 * mm)]
-    if sample:
-        story += [Paragraph("<b>SAMPLE DATA - mock-up only, not a real check.</b>", ParagraphStyle(
-            "s", parent=cell, textColor=colors.HexColor("#b00020"), fontSize=9)), Spacer(1, 3 * mm)]
-    if metrics:
-        mt = Table([[Paragraph(f"<b>{escape(str(v))}</b><br/>{escape(k)}", ParagraphStyle(
-            "m", parent=cell, fontSize=10, leading=13, alignment=1)) for k, v in metrics]], hAlign="LEFT")
-        mt.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-                                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-                                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f5f7")),
-                                ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
-        story += [mt, Spacer(1, 5 * mm)]
-    cols = list(df.columns)
-    data = [[Paragraph(escape(str(c)), head) for c in cols]]
-    for _, r in df.iterrows():
-        data.append([Paragraph(escape(str(r[c])), cell) for c in cols])
+    h2 = ParagraphStyle("h2", parent=ss["Normal"], fontSize=11, leading=14, fontName="Helvetica-Bold", spaceBefore=6, spaceAfter=4)
+    P = lambda t, s=cell: Paragraph(escape(str(t if t is not None else "")), s)
     avail = landscape(A4)[0] - 24 * mm
-    widths = [avail / len(cols)] * len(cols)
-    tbl = Table(data, colWidths=widths, repeatRows=1)
-    style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f3a4a")),
-             ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("VALIGN", (0, 0), (-1, -1), "TOP"),
-             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fb")])]
-    if status_col in cols:
-        k = cols.index(status_col)
-        pal = {"OK": "#d7f0dd", "Check": "#fff0c2", "Missing": "#f9d3d3"}
-        for n, (_, r) in enumerate(df.iterrows(), start=1):
-            if str(r[status_col]) in pal:
-                style.append(("BACKGROUND", (k, n), (k, n), colors.HexColor(pal[str(r[status_col])])))
-    tbl.setStyle(TableStyle(style))
-    story.append(tbl)
-    if note:
-        story += [Spacer(1, 4 * mm), Paragraph(escape(note), sub)]
+    story = [Paragraph(escape(title), h1), Paragraph(escape(subtitle), sub), Spacer(1, 3 * mm)]
+    if metrics:
+        mt = Table([[Paragraph(f"<b>{escape(str(v))}</b><br/>{escape(k)}", ParagraphStyle("m", parent=cell, fontSize=9.5, leading=12, alignment=1))
+                     for k, v in metrics]], hAlign="LEFT", colWidths=[34 * mm] * len(metrics))
+        mt.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey), ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f5f7")),
+                                ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+        story += [mt, Spacer(1, 4 * mm)]
+    pal = {"OK": "#d7f0dd", "Check": "#fff0c2", "Missing": "#f9d3d3", "Added": "#d7f0dd", "Removed": "#f9d3d3"}
+    for k, (heading, df, widths) in enumerate(sections):
+        if k:
+            story.append(Spacer(1, 4 * mm))
+        story.append(Paragraph(escape(heading), h2))
+        if df is None or df.empty:
+            story.append(Paragraph("Nothing to report.", sub))
+            continue
+        cols = [c for c in df.columns if not c.startswith("_")]
+        ws = [w * mm if w else None for w in (widths or [None] * len(cols))]
+        fixed = sum(w for w in ws if w)
+        free = [i for i, w in enumerate(ws) if not w]
+        ws = [w if w else (avail - fixed) / max(len(free), 1) for w in ws]
+        data = [[P(c, head) for c in cols]] + [[P(r[c], cellb if c in status_cols or c == cols[0] else cell) for c in cols] for _, r in df.iterrows()]
+        t = Table(data, colWidths=ws, repeatRows=1)
+        st_ = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f3a4a")), ("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey),
+               ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 2.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+               ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fb")])]
+        for c in cols:
+            if c in status_cols or c == "Change":
+                ci = cols.index(c)
+                for n, (_, r) in enumerate(df.iterrows(), start=1):
+                    if str(r[c]) in pal:
+                        st_.append(("BACKGROUND", (ci, n), (ci, n), colors.HexColor(pal[str(r[c])])))
+                    elif c == "Change":
+                        st_.append(("BACKGROUND", (ci, n), (ci, n), colors.HexColor("#fff0c2")))
+        t.setStyle(TableStyle(st_))
+        story.append(t)
+    if notes:
+        story += [Spacer(1, 4 * mm), Paragraph("Notes", h2)]
+        story += [Paragraph("&bull; " + escape(n), sub) for n in notes]
+    if images:
+        story += [PageBreak(), Paragraph("Drawings that changed (before | after)", h2)]
+        from reportlab.lib.utils import ImageReader
+        for cap, a, b in images:
+            story.append(Paragraph(escape(cap), cellb))
+            ims = []
+            for png in (a, b):
+                ir = ImageReader(io.BytesIO(png)); iw, ih = ir.getSize()
+                w = avail / 2 - 3 * mm; h = min(ih * w / iw, 62 * mm); w = min(w, iw * h / ih)
+                ims.append(RLImage(io.BytesIO(png), width=w, height=h))
+            tb = Table([ims], colWidths=[avail / 2] * 2)
+            tb.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.lightgrey),
+                                    ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+            story += [tb, Spacer(1, 3 * mm)]
 
     def footer(canvas, d):
         canvas.saveState()
@@ -1823,92 +2225,193 @@ def build_report_pdf(title, subtitle, metrics, df, status_col=None, note="", sam
     return buf.getvalue()
 
 
-def _mock_banner(text):
-    st.warning("MOCK-UP: " + text)
+# ---- Screens: Manual Checker + Revision Checker ----------------------------------------------
+def _ck_manual_png(manual_bytes, pno, scale=0.9):
+    doc = pdfium.PdfDocument(manual_bytes)
+    try:
+        pg = doc[pno - 1]
+        try:
+            im = pg.render(scale=scale).to_pil().convert("RGB")
+        finally:
+            pg.close()
+    finally:
+        doc.close()
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _ck_df(rows, cols):
+    return pd.DataFrame([{c: r.get(c, "") for c in cols} for r in rows], columns=cols)
 
 
 def manual_checker(retailer):
     st.subheader(f"Manual Checker - {retailer}")
-    st.caption("Checks your finished manual against the pack the client supplied, and flags anything that doesn't agree.")
-    _mock_banner("the screen is real but the results below are sample data. Uploading files doesn't run the check yet.")
+    st.caption("Checks your finished sign manual against the pack the client supplied, sign by sign: is it in the pack, "
+               "does the quantity agree, do the sizes agree, and does the pack itself flag it as unsettled.")
     u1, u2 = st.columns(2)
-    u1.file_uploader("Your manual (PDF)", type=["pdf"], key=f"mc_manual_{retailer}")
-    u2.file_uploader(f"{retailer} pack from the client (PDF)", type=["pdf"], key=f"mc_pack_{retailer}")
-    if not st.toggle("Show sample results", value=True, key=f"mc_demo_{retailer}"):
+    mf = u1.file_uploader("Your manual (PDF, Geetee sheets)", type=["pdf"], key=f"mc_manual_{retailer}")
+    pf = u2.file_uploader(f"{retailer} pack from the client (PDF)", type=["pdf"], key=f"mc_pack_{retailer}")
+    if not (mf and pf):
+        st.info("Upload both files. Internal signage only - sheets such as plans and elevations in your manual are read as layout, not as signs.")
         return
-
-    df = MANUAL_DEMO
+    mb, pb = mf.getvalue(), pf.getvalue()
+    try:
+        pages = read_manual(mb)
+        signs, layout = manual_signs(pages)
+        pack = ck_pack(pb, retailer, True)
+    except Exception as e:
+        st.error(f"Couldn't read one of those files: {e}")
+        return
+    if not signs:
+        st.error("No Geetee sign sheets found in the manual (looking for the DESCRIPTION / DRAWING NUMBER title block).")
+        return
+    if not pack["rows"]:
+        st.error("Nothing found in the pack. Check it's the right drawing pack for this retailer.")
+        return
+    for w in pack["warnings"]:
+        st.warning(w)
+    checks, summ, pack_only = ck_check(signs, pack["rows"], retailer)
+    df = _ck_df(checks, ["Sign", "Dwg", "Check", "Manual says", "Pack says", "Status", "Note", "Manual page", "Pack page"])
+    po = _ck_df(pack_only, ["Sign", "Code", "Qty", "Where", "Pack page", "Status", "Note"])
+    n_ok = sum(1 for s in summ if s["status"] == "OK")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Checks run", len(df))
-    c2.metric("OK", int((df["Status"] == "OK").sum()))
-    c3.metric("To check", int((df["Status"] == "Check").sum()))
-    c4.metric("Missing", int((df["Status"] == "Missing").sum()))
+    c1.metric("Signs in manual", len(summ))
+    c2.metric("All OK", n_ok)
+    c3.metric("To check", len(summ) - n_ok)
+    c4.metric("In pack, not in manual", len(po))
+    st.caption(f"Pack read in {'signage-key' if pack['mode'] == 'key' else 'callout'} mode: {len(pack['rows'])} rows. "
+               f"{len(layout)} layout sheet(s) in your manual were skipped.")
 
-    show = st.multiselect("Show", ["OK", "Check", "Missing"], default=["Check", "Missing"], key=f"mc_filter_{retailer}")
-    view = df[df["Status"].isin(show)].reset_index(drop=True)
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    t1, t2, t3 = st.tabs(["Checks", "In the pack, not in your manual", "Manual sheets read"])
+    with t1:
+        show = st.multiselect("Show", ["OK", "Check"], default=["Check"], key=f"mc_filter_{retailer}")
+        only_issue = st.checkbox("Hide the 'In the pack' OK lines for signs that are otherwise fine", value=False, key=f"mc_hide_{retailer}")
+        view = df[df["Status"].isin(show)].reset_index(drop=True)
+        if only_issue:
+            bad = set(df.loc[df["Status"] == "Check", "Sign"])
+            view = view[view["Sign"].isin(bad)].reset_index(drop=True)
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        if not view.empty:
+            allv = [r for r in checks if r["Status"] in show]
+            i = st.selectbox("Look at one", range(len(allv)), key=f"mc_pick_{retailer}",
+                             format_func=lambda k: f"{allv[k]['Sign']} - {allv[k]['Check']} ({allv[k]['Status']})")
+            r = allv[i]
+            a, b = st.columns(2)
+            a.image(_ck_manual_png(mb, r["_mp"]), caption=f"Your manual, p{r['_mp']}")
+            snip = next((s for k in r["_keys"] for s in pack["snips"].get(k, [])), None)
+            if snip is not None:
+                b.image(snip["png"] if isinstance(snip, dict) else snip, caption="Pack drawing / callout")
+            else:
+                b.info(f"Pack: {r['Pack says'] or 'nothing matched'}" + (f"  ({r['Pack page']})" if r["Pack page"] else ""))
+            if r["Note"]:
+                st.info(r["Note"])
+    with t2:
+        st.caption("Pack items that no sheet in your manual seems to cover - new signs, existing/retained items, client-supplied graphics, or noise.")
+        st.dataframe(po, use_container_width=True, hide_index=True)
+    with t3:
+        sm = pd.DataFrame([{"Pages": s["pages"], "Dwg": s["dwg"], "Sign": s["sign"], "Pack rows": s["n_pack"],
+                            "Status": s["status"], "Last revision": s["rev"]} for s in summ])
+        st.dataframe(sm, use_container_width=True, hide_index=True)
+        if layout:
+            st.caption("Skipped as layout: " + "; ".join(f"p{p['page']} {p['title']}" for p in layout))
 
-    if not view.empty:
-        i = st.selectbox("Look at one", range(len(view)),
-                         format_func=lambda k: f"{view.loc[k, 'Sign']} - {view.loc[k, 'Check']} ({view.loc[k, 'Status']})",
-                         key=f"mc_pick_{retailer}")
-        r = view.iloc[i]
-        st.markdown(f"**{r['Sign']}** - {r['Check']}")
-        a, b = st.columns(2)
-        a.image(_demo_png(f"YOUR MANUAL (sample)\n\n{r['Sign']}\n{r['Manual says']}"), caption="Your manual page")
-        b.image(_demo_png(f"CLIENT PACK (sample)\n\n{r['Sign']}\n{r['Pack says']}"), caption="Pack drawing / callout")
-        if r["Note"]:
-            st.info(r["Note"])
-    pdf = build_report_pdf(f"Manual check - {retailer}", "Your manual checked against the client pack",
-                           [("Checks run", len(df)), ("OK", int((df["Status"] == "OK").sum())),
-                            ("To check", int((df["Status"] == "Check").sum())),
-                            ("Missing", int((df["Status"] == "Missing").sum()))],
-                           df, status_col="Status", sample=True)
-    st.download_button("Download check sheet (PDF)", pdf, "manual_check_sample.pdf", "application/pdf",
-                       key=f"mc_dl_{retailer}")
+    sec = [("Checks needing attention", df[df["Status"] == "Check"].drop(columns=["Dwg"]), [40, 24, 52, 62, 16, None, 14, 14]),
+           ("Pack items not covered by a manual sheet", po, [70, 20, 10, 50, 16, 16, None])]
+    pdf = ck_report_pdf(f"Manual check - {retailer}", f"{mf.name}  checked against  {pf.name}  (internal signage only)",
+                        [("Signs in manual", len(summ)), ("All OK", n_ok), ("To check", len(summ) - n_ok), ("Pack, not in manual", len(po))],
+                        [(h, d, w) for (h, d, w) in sec],
+                        notes=["Signs are matched to the pack by name (and by code for TK Maxx), so a Check line may be a naming difference rather than a real error.",
+                               "Quantities are compared to what your sheet states ('N No. required'); sheets that state none are not compared.",
+                               "Layout-only sheets (plans, elevations) in the manual are not treated as signs."])
+    d1, d2 = st.columns(2)
+    d1.download_button("Download check sheet (PDF, A4 landscape)", pdf, "manual_check.pdf", "application/pdf", key=f"mc_dl_{retailer}")
+    d2.download_button("Download checks (CSV)", df.to_csv(index=False).encode("utf-8-sig"), "manual_check.csv", "text/csv", key=f"mc_csv_{retailer}")
+
+
+def _rv_impact(change, signs, idf):
+    if not signs:
+        return change[5]
+    r = change[1]
+    sc = max(((ck_score(s, r, idf), s) for s in signs), key=lambda x: x[0], default=(0, None))
+    if sc[0] >= 0.5:
+        s = sc[1]
+        return f"{change[5].split(' on ')[0]} - manual p{', p'.join(str(p) for p in s['pages'])} ({s['dwg']})"
+    return "No manual sheet found - " + ("new sheet needed" if change[0] == "Added" else "check whether one is needed")
 
 
 def revision_checker(retailer):
     st.subheader(f"Revision Checker - {retailer}")
-    st.caption("Compares the pack you've worked from with revised drawings, and lists what changed and what it means for your manual.")
-    _mock_banner("the screen is real but the results below are sample data (taken from the revision notes in your Geetee manual). "
-                 "Uploading files doesn't run the comparison yet.")
+    st.caption("Compares the pack you've worked from with the revised pack: signs added, removed or changed, drawings that have been "
+               "redrawn, and (if you add your manual) which manual sheets are affected.")
     u1, u2 = st.columns(2)
-    u1.file_uploader("Pack you've worked from (PDF)", type=["pdf"], key=f"rc_old_{retailer}")
-    u2.file_uploader("Revised drawings (PDF)", type=["pdf"], key=f"rc_new_{retailer}")
-    if not st.toggle("Show sample results", value=True, key=f"rc_demo_{retailer}"):
+    of = u1.file_uploader("Pack you've worked from (PDF)", type=["pdf"], key=f"rc_old_{retailer}")
+    nf = u2.file_uploader("Revised pack (PDF)", type=["pdf"], key=f"rc_new_{retailer}")
+    mf = st.file_uploader("Optional: your manual (PDF) - adds 'which sheet to update'", type=["pdf"], key=f"rc_man_{retailer}")
+    vis = st.checkbox("Also compare the drawings visually (finds changes the text doesn't show)", value=True, key=f"rc_vis_{retailer}")
+    if not (of and nf):
+        st.info("Upload the old and the revised pack.")
         return
-
-    df = REVISION_DEMO
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Changes", len(df))
+    ob, nb = of.getvalue(), nf.getvalue()
+    if hashlib.md5(ob).hexdigest() == hashlib.md5(nb).hexdigest():
+        st.success("These two files are identical - nothing has changed.")
+        return
+    try:
+        rv = ck_revision(ob, nb, retailer, vis)
+    except Exception as e:
+        st.error(f"Couldn't compare those files: {e}")
+        return
+    signs = []
+    if mf:
+        try:
+            signs, _ = manual_signs(read_manual(mf.getvalue()))
+        except Exception as e:
+            st.warning(f"Couldn't read the manual, so manual impact isn't shown: {e}")
+    idf = ck_idf(signs, rv["old_rows"] + rv["new_rows"]) if signs else None
+    chg = rv["changes"]
+    rows = [{"Change": c[0], "Sign": c[1]["desc"][:90], "Code": c[1]["code"], "Was": c[2], "Now": c[3],
+             "Where": (c[1]["position"] or c[1]["level"])[:60],
+             "Manual impact": _rv_impact(c, signs, idf) if signs else c[5]} for c in chg]
+    df = pd.DataFrame(rows, columns=["Change", "Sign", "Code", "Was", "Now", "Where", "Manual impact"])
+    sh = pd.DataFrame(rv["sheets"], columns=["Change", "Sheet", "Old page", "New page"])
+    pix = rv["pix"]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Sign changes", len(df))
     c2.metric("Added", int((df["Change"] == "Added").sum()))
     c3.metric("Removed", int((df["Change"] == "Removed").sum()))
     c4.metric("Amended", int((~df["Change"].isin(["Added", "Removed"])).sum()))
-
-    kinds = sorted(df["Change"].unique())
-    pick = st.multiselect("Change types", kinds, default=kinds, key=f"rc_filter_{retailer}")
-    view = df[df["Change"].isin(pick)].reset_index(drop=True)
-    st.dataframe(view, use_container_width=True, hide_index=True)
-
-    if not view.empty:
-        i = st.selectbox("Look at one", range(len(view)),
-                         format_func=lambda k: f"{view.loc[k, 'Sign']} - {view.loc[k, 'Change']}", key=f"rc_pick_{retailer}")
-        r = view.iloc[i]
-        a, b = st.columns(2)
-        a.image(_demo_png(f"BEFORE (sample)\n\n{r['Sign']}\n{r['Was']}"), caption="Old pack")
-        b.image(_demo_png(f"AFTER (sample)\n\n{r['Sign']}\n{r['Now']}", tint=(240, 246, 240)), caption="Revised drawing")
-        st.info(f"Manual impact: {r['Manual impact']}  |  Where: {r['Where']}")
-    with st.expander("Revision history read from the title blocks"):
-        st.dataframe(REV_HISTORY_DEMO, use_container_width=True, hide_index=True)
-    pdf = build_report_pdf(f"Revision check - {retailer}", "Revised drawings compared with the pack worked from",
-                           [("Changes", len(df)), ("Added", int((df["Change"] == "Added").sum())),
-                            ("Removed", int((df["Change"] == "Removed").sum())),
-                            ("Amended", int((~df["Change"].isin(["Added", "Removed"])).sum()))],
-                           df, sample=True,
-                           note="Revision history: " + "; ".join(f"Rev {a} {b} - {c}" for a, b, c in REV_HISTORY_DEMO.itertuples(index=False)))
-    st.download_button("Download change list (PDF)", pdf, "revision_changes_sample.pdf", "application/pdf",
-                       key=f"rc_dl_{retailer}")
+    c5.metric("Drawings redrawn", len(pix))
+    st.caption(f"Old pack: {rv['n_old']} rows. Revised pack: {rv['n_new']} rows. "
+               "Sign changes compare the schedules read from each pack; 'Drawings redrawn' compares the sheets pixel by pixel "
+               "(the title-block strip is ignored).")
+    t1, t2, t3 = st.tabs(["Sign changes", "Sheets added / removed", "Drawings that changed"])
+    with t1:
+        kinds = sorted(df["Change"].unique())
+        pick = st.multiselect("Change types", kinds, default=kinds, key=f"rc_filter_{retailer}")
+        st.dataframe(df[df["Change"].isin(pick)].reset_index(drop=True), use_container_width=True, hide_index=True)
+    with t2:
+        st.dataframe(sh, use_container_width=True, hide_index=True)
+    with t3:
+        if not vis:
+            st.info("Visual comparison is switched off.")
+        elif not pix:
+            st.success("No sheet shows a visible change outside the title block.")
+        for r in pix[:25]:
+            st.markdown(f"**{r['label']}**  -  old p{r['old']} / new p{r['new']}  ({r['frac'] * 100:.2f}% of the sheet changed"
+                        + (", sheet size differs - treat with care" if r["size_differs"] else "") + ")")
+            a, b = st.columns(2)
+            a.image(r["before"], caption="Before")
+            b.image(r["after"], caption="After")
+    pdf = ck_report_pdf(f"Revision check - {retailer}", f"{of.name}  ->  {nf.name}",
+                        [("Sign changes", len(df)), ("Added", int((df["Change"] == "Added").sum())), ("Removed", int((df["Change"] == "Removed").sum())),
+                         ("Amended", int((~df["Change"].isin(["Added", "Removed"])).sum())), ("Drawings redrawn", len(pix))],
+                        [("Sign changes", df, [24, 62, 14, 46, 46, 30, None]), ("Sheets added / removed", sh, [30, 100, 25, 25])],
+                        notes=["Changes come from comparing the schedule read from each pack, so renamed signs can appear as Removed + Added.",
+                               "Drawings redrawn are found by comparing rendered sheets; the right-hand title-block strip is ignored."],
+                        status_cols=("Change",), images=[(f"{r['label']}  (old p{r['old']} / new p{r['new']})", r["before"], r["after"]) for r in pix[:12]])
+    d1, d2 = st.columns(2)
+    d1.download_button("Download change list (PDF, A4 landscape)", pdf, "revision_changes.pdf", "application/pdf", key=f"rc_dl_{retailer}")
+    d2.download_button("Download changes (CSV)", df.to_csv(index=False).encode("utf-8-sig"), "revision_changes.csv", "text/csv", key=f"rc_csv_{retailer}")
 
 
 st.title("Store Signage Tools")
