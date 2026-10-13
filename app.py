@@ -2,8 +2,7 @@
 Store Signage Schedule Extractor
 --------------------------------
 Run:   streamlit run app.py
-Needs: pip install streamlit pdfplumber pandas openpyxl pillow reportlab anthropic
-       (pypdfium2 comes with pdfplumber)
+Needs: pip install streamlit pdfplumber pypdfium2 pandas openpyxl pillow reportlab anthropic
 """
 import base64
 import hashlib
@@ -15,8 +14,11 @@ import re
 import zipfile
 from collections import Counter, defaultdict
 
+import difflib
+
 import pandas as pd
 import pdfplumber
+import pypdfium2 as pdfium
 import streamlit as st
 from PIL import Image, ImageDraw
 
@@ -42,7 +44,7 @@ def is_schedule_page(text: str) -> bool:
 
 def classify_page(text: str, sheet_no: str = ""):
     t = text.lower()
-    m = re.search(r"\b(L\d{2})[ _-]*Signage[ _-]*Plan\b", text, re.I)
+    m = re.search(r"\b(L\d{2})[_ ]Signage Plan", text, re.I)
     if m:
         return "plan", m.group(1).upper()
     if any(kw in t for kw in ["elevation", "elev", "internal elevation", "backwall", "shopfront", "section"]) or re.match(r"^A[45]\d{2}", sheet_no):
@@ -76,270 +78,690 @@ def size_from_name(desc: str) -> str:
     return "; ".join(out)
 
 
-def nearest_view_title(words, hit) -> str:
-    cands = [w for w in words if "elevation" in w["text"].lower() or re.match(r"^L\d{2}_", w["text"])]
-    if not cands:
+# --------------------------------------------------------------------------------------
+# PDF layer (pypdfium2) - rotation-safe text positions and crops
+# Many drawing sheets are stored with a /Rotate flag. pdfplumber reads those as mirrored /
+# vertical text and its crops land in the wrong place, so positions come from here instead.
+# All coordinates below are "displayed" points: origin top-left, y down.
+# --------------------------------------------------------------------------------------
+def geom(page):
+    rot = page.get_rotation() % 360
+    L, B, R, T = page.get_bbox()
+    w, h = R - L, T - B
+    dw, dh = (w, h) if rot in (0, 180) else (h, w)
+
+    def tf(x, y):
+        u, v = x - L, y - B
+        if rot == 0:
+            return u, h - v
+        if rot == 90:
+            return v, u
+        if rot == 180:
+            return w - u, v
+        return h - v, w - u
+
+    return tf, dw, dh
+
+
+def box_tf(tf, l, b, r, t):
+    xs, ys = zip(tf(l, b), tf(r, t), tf(l, t), tf(r, b))
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def page_runs(page):
+    """Text runs (roughly one per line/label) with displayed bboxes."""
+    tf, dw, dh = geom(page)
+    tp = page.get_textpage()
+    out = []
+    try:
+        for i in range(tp.count_rects()):
+            l, b, r, t = tp.get_rect(i)
+            s = tp.get_text_bounded(l, b, r, t)
+            s = re.sub(r"\s+", " ", s.replace("\ufffe", "-").replace("\x02", "-")).strip()
+            if not s:
+                continue
+            x0, y0, x1, y1 = box_tf(tf, l, b, r, t)
+            out.append({"t": s, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "h": max(y1 - y0, 1.0)})
+    finally:
+        tp.close()
+    return out, dw, dh
+
+
+def runs_to_text(runs):
+    """Rebuild reading-order lines from runs (used for rotated pages, where pdfplumber text is unusable)."""
+    if not runs:
         return ""
-    cx, cy = (hit["x0"] + hit["x1"]) / 2, (hit["top"] + hit["bottom"]) / 2
-    def dist(w):
-        dy = w["top"] - cy
-        return math.hypot((w["x0"] + w["x1"]) / 2 - cx, dy * 3 if dy < 0 else dy)
-    best = min(cands, key=dist)
-    line = sorted([w for w in words if abs(w["top"] - best["top"]) < 4], key=lambda w: w["x0"])
-    idx = line.index(best)
-    lo = hi = idx
-    while lo > 0 and line[lo]["x0"] - line[lo - 1]["x1"] < 18:
-        lo -= 1
-    while hi < len(line) - 1 and line[hi + 1]["x0"] - line[hi]["x1"] < 18:
-        hi += 1
-    return " ".join(w["text"] for w in line[lo:hi + 1])
+    runs = sorted(runs, key=lambda r: ((r["y0"] + r["y1"]) / 2, r["x0"]))
+    lines, cur, cy = [], [], None
+    for r in runs:
+        c = (r["y0"] + r["y1"]) / 2
+        if cur and abs(c - cy) <= 0.6 * r["h"]:
+            cur.append(r)
+        else:
+            if cur:
+                lines.append(cur)
+            cur, cy = [r], c
+    if cur:
+        lines.append(cur)
+    return "\n".join(" ".join(r["t"] for r in sorted(l, key=lambda r: r["x0"])) for l in lines)
 
 
-def render_crop(page, hit, half_w, half_h, dpi) -> bytes:
-    x0, top, x1, bottom = page.bbox
-    cx, cy = (hit["x0"] + hit["x1"]) / 2, (hit["top"] + hit["bottom"]) / 2
-    box = (max(x0, cx - half_w), max(top, cy - half_h), min(x1, cx + half_w), min(bottom, cy + half_h))
-    im = page.crop(box).to_image(resolution=dpi).original.convert("RGB")
-    s = dpi / 72.0
-    pad = 3
-    ImageDraw.Draw(im).rectangle(
-        [(hit["x0"] - box[0]) * s - pad, (hit["top"] - box[1]) * s - pad,
-         (hit["x1"] - box[0]) * s + pad, (hit["bottom"] - box[1]) * s + pad],
-        outline=(220, 0, 0), width=3)
+def crop_image(page, box, scale, marks=()):
+    tf, dw, dh = geom(page)
+    x0, y0, x1, y1 = box
+    im = page.render(scale=scale, crop=(x0, dh - y1, dw - x1, y0)).to_pil().convert("RGB")
+    d = ImageDraw.Draw(im)
+    for m in marks:
+        d.rectangle([(m[0] - x0) * scale - 4, (m[1] - y0) * scale - 4,
+                     (m[2] - x0) * scale + 4, (m[3] - y0) * scale + 4], outline=(220, 0, 0), width=3)
+    return im
+
+
+def crop_png(page, centre, half_w, half_h, scale, marks=()):
+    tf, dw, dh = geom(page)
+    cx, cy = centre
+    box = (max(0, cx - half_w), max(0, cy - half_h), min(dw, cx + half_w), min(dh, cy + half_h))
+    im = crop_image(page, box, scale, marks)
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return buf.getvalue()
 
 
+_DASHES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
+                         "\u2212": "-", "\u00ad": "-", "\ufffe": "-", "\u00a0": " "})
+
+
+def find_code_boxes(page, code_re, code_map):
+    """[(code, (x0,y0,x1,y1) displayed)] for every exact occurrence of a schedule code on the page."""
+    if code_re is None:
+        return []
+    tf, dw, dh = geom(page)
+    tp = page.get_textpage()
+    out = []
+    try:
+        raw = tp.get_text_range()
+        norm = raw.translate(_DASHES).upper()
+        ok = len(raw) == tp.count_chars()
+        runs = None
+        for m in code_re.finditer(norm):
+            code = code_map[m.group(1)]
+            box = None
+            if ok:
+                try:
+                    bs = [tp.get_charbox(k) for k in range(m.start(), m.end()) if not raw[k].isspace()]
+                    if bs:
+                        box = box_tf(tf, min(b[0] for b in bs), min(b[1] for b in bs),
+                                     max(b[2] for b in bs), max(b[3] for b in bs))
+                except Exception:
+                    box = None
+            if box is None:                      # fall back to the whole text run containing the code
+                if runs is None:
+                    runs = page_runs(page)[0]
+                r = next((r for r in runs if m.group(1) in r["t"].translate(_DASHES).upper()), None)
+                if r:
+                    box = (r["x0"], r["y0"], r["x1"], r["y1"])
+            if box:
+                out.append((code, box))
+    finally:
+        tp.close()
+    return out
+
+
+def nearest_view_title(runs, hit) -> str:
+    cands = [r for r in runs if "elevation" in r["t"].lower() or re.match(r"^L\d{2}_", r["t"])]
+    if not cands:
+        return ""
+    cx, cy = (hit[0] + hit[2]) / 2, (hit[1] + hit[3]) / 2
+
+    def dist(r):
+        dy = (r["y0"] + r["y1"]) / 2 - cy
+        return math.hypot((r["x0"] + r["x1"]) / 2 - cx, dy * 3 if dy < 0 else dy)
+
+    return min(cands, key=dist)["t"][:70]
+
+
 # --------------------------------------------------------------------------------------
-# Core analysis
+# TK Maxx analysis
 # --------------------------------------------------------------------------------------
 def _analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi):
-    rows, unmatched, notes, page_rows = [], [], [], []
-    texts = {}
+    rows, unmatched, notes, page_rows, warnings = [], [], [], [], []
+    doc = pdfium.PdfDocument(pdf_bytes)
+    n_pages = len(doc)
+    scale = dpi / 72.0
+
+    # ---- text per page. Upright pages: pdfplumber layout text (as before). Rotated pages: rebuilt from pdfium.
+    texts, rotated = {}, set()
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages, 1):
+        for i in range(1, n_pages + 1):
+            pg = doc[i - 1]
             try:
-                texts[i] = page.extract_text() or ""
+                if pg.get_rotation() % 360:
+                    rotated.add(i)
+                    texts[i] = runs_to_text(page_runs(pg)[0])
+                else:
+                    texts[i] = pdf.pages[i - 1].extract_text() or ""
             except Exception:
                 texts[i] = ""
-
-        sched_pages = [i for i, t in texts.items() if is_schedule_page(t)]
-        fallback = not sched_pages
-        scan = list(texts) if fallback else sched_pages
-
-        for i in scan:
-            for line in texts[i].splitlines():
-                line = line.strip()
-                m = ROW_RE.match(line)
-                if m:
-                    level, raw, code, qty, tail = m.groups()
-                    mod = re.search(r"\bMOD\d+\b", tail)
-                    rows.append({
-                        "level": level, "code": code, "desc": clean_description(raw),
-                        "qty": int(qty), "mod": mod.group(0) if mod else "", "sched_page": i,
-                    })
-                elif not fallback and re.match(r"^L\d{2}\s", line) and "TK" in line:
-                    unmatched.append(f"p{i}: {line}")
-
-        for i, t in texts.items():
-            for line in t.splitlines():
-                if re.search(r"\bFFL\b", line) and line.strip() not in notes:
-                    notes.append(line.strip())
-
-        codes = {str(r["code"]).upper() for r in rows if r.get("code")}
-        hits = defaultdict(list)
-        # Match every non-schedule page. Do not pre-filter with page.extract_text():
-        # CAD exports often omit or fragment code strings in the plain-text layer.
-        for i, page in enumerate(pdf.pages, 1):
-            sheet = ""
-            c = Counter(re.findall(r"\\bA\\d{3}\\b", texts[i], re.I))
-            if c:
-                sheet = c.most_common(1)[0][0].upper()
-
-            kind, plevel = classify_page(texts[i], sheet) if i not in sched_pages else ("schedule", "")
-            n_codes_here = 0
-            if i not in sched_pages and codes:
+            finally:
+                pg.close()
                 try:
-                    words = page.extract_words(
-                        x_tolerance=2, y_tolerance=3, keep_blank_chars=False,
-                        use_text_flow=False
-                    )
+                    pdf.pages[i - 1].flush_cache()
                 except Exception:
-                    words = []
+                    pass
 
-                # Cluster words by baseline. A code may be represented as TK21, -, 12.
-                line_groups = []
-                for w in sorted(words, key=lambda x: (x["top"], x["x0"])):
-                    target = next((g for g in reversed(line_groups[-8:])
-                                   if abs(g["top"] - w["top"]) <= 4), None)
-                    if target is None:
-                        target = {"top": w["top"], "words": []}
-                        line_groups.append(target)
-                    target["words"].append(w)
+    # ---- schedule rows
+    row_pages = Counter()
+    for i, t in texts.items():
+        if is_schedule_page(t):
+            for line in t.splitlines():
+                if ROW_RE.match(line.strip()):
+                    row_pages[i] += 1
+    sched_pages = [i for i in texts if is_schedule_page(texts[i]) and row_pages[i] >= 1]
+    fallback = not sched_pages
+    scan = list(texts) if fallback else sched_pages
+    for i in scan:
+        for line in texts[i].splitlines():
+            line = line.strip()
+            m = ROW_RE.match(line)
+            if m:
+                level, raw, code, qty, tail = m.groups()
+                mod = re.search(r"\bMOD\d+\b", tail)
+                rows.append({"level": level, "code": code, "desc": clean_description(raw),
+                             "qty": int(qty), "mod": mod.group(0) if mod else "", "sched_page": i})
+            elif not fallback and re.match(r"^L\d{2}\s", line) and "TK" in line:
+                unmatched.append(f"p{i}: {line}")
 
-                found_on_page = []
-                for g in line_groups:
-                    lw = sorted(g["words"], key=lambda x: x["x0"])
-                    # Avoid joining unrelated labels far apart on a drawing line.
-                    clusters = []
-                    for w in lw:
-                        if not clusters or w["x0"] - clusters[-1][-1]["x1"] > 36:
-                            clusters.append([w])
-                        else:
-                            clusters[-1].append(w)
-                    for cluster in clusters:
-                        compact_chars, char_words = [], []
-                        for w in cluster:
-                            token = re.sub(r"\\s+", "", str(w.get("text", "")).upper())
-                            compact_chars.extend(token)
-                            char_words.extend([w] * len(token))
-                        compact = "".join(compact_chars)
-                        if not compact:
-                            continue
-                        for matched_code in sorted(codes, key=len, reverse=True):
-                            mc = re.sub(r"\\s+", "", matched_code.upper())
-                            # Ignore matches embedded in a longer alphanumeric code.
-                            pat = re.compile(r"(?<![A-Z0-9])" + re.escape(mc) + r"(?![A-Z0-9])")
-                            for match in pat.finditer(compact):
-                                matched_words = char_words[match.start():match.end()]
-                                if not matched_words:
-                                    continue
-                                x0 = min(w["x0"] for w in matched_words)
-                                x1 = max(w["x1"] for w in matched_words)
-                                top = min(w["top"] for w in matched_words)
-                                bottom = max(w["bottom"] for w in matched_words)
-                                found_on_page.append((matched_code, x0, x1, top, bottom))
+    for i, t in texts.items():
+        for line in t.splitlines():
+            if re.search(r"\bFFL\b", line) and line.strip() not in notes:
+                notes.append(line.strip())
 
-                # Character-level fallback catches PDFs whose word segmentation is unusable.
-                if not found_on_page:
-                    try:
-                        chars = [ch for ch in page.chars if str(ch.get("text", "")).strip()]
-                    except Exception:
-                        chars = []
-                    char_lines = []
-                    for ch in sorted(chars, key=lambda x: (x["top"], x["x0"])):
-                        target = next((g for g in reversed(char_lines[-10:])
-                                       if abs(g["top"] - ch["top"]) <= 3), None)
-                        if target is None:
-                            target = {"top": ch["top"], "chars": []}
-                            char_lines.append(target)
-                        target["chars"].append(ch)
-                    for g in char_lines:
-                        line_chars = sorted(g["chars"], key=lambda x: x["x0"])
-                        compact_chars, char_boxes = [], []
-                        prev = None
-                        for ch in line_chars:
-                            # Large horizontal gaps separate drawing labels; keep them separate.
-                            if prev is not None and ch["x0"] - prev["x1"] > 36:
-                                compact_chars.append(" ")
-                                char_boxes.append(None)
-                            token = re.sub(r"\\s+", "", str(ch.get("text", "")).upper())
-                            compact_chars.extend(token)
-                            char_boxes.extend([ch] * len(token))
-                            prev = ch
-                        compact = "".join(compact_chars)
-                        for matched_code in sorted(codes, key=len, reverse=True):
-                            mc = re.sub(r"\\s+", "", matched_code.upper())
-                            pat = re.compile(r"(?<![A-Z0-9])" + re.escape(mc) + r"(?![A-Z0-9])")
-                            for match in pat.finditer(compact):
-                                boxes = [b for b in char_boxes[match.start():match.end()] if b]
-                                if boxes:
-                                    found_on_page.append((
-                                        matched_code,
-                                        min(b["x0"] for b in boxes), max(b["x1"] for b in boxes),
-                                        min(b["top"] for b in boxes), max(b["bottom"] for b in boxes)
-                                    ))
+    codes = {r["code"] for r in rows}
+    code_map = {c.upper(): c for c in codes}
+    code_re = (re.compile(r"(?<![A-Z0-9_-])(" + "|".join(re.escape(c) for c in sorted(code_map, key=len, reverse=True)) +
+                          r")(?![A-Z0-9_-])") if code_map else None)
 
-                seen_hits = set()
-                for matched_code, x0, x1, top, bottom in found_on_page:
-                    dedupe = (matched_code, round(x0), round(top))
-                    if dedupe in seen_hits:
-                        continue
-                    seen_hits.add(dedupe)
-                    n_codes_here += 1
-                    # Plan detection uses the page title and level. Other code-bearing sheets
-                    # are retained as elevation candidates rather than discarded.
-                    hit_kind = kind
-                    if hit_kind == "other":
-                        hit_kind = "elevation"
-                    h = {"page": i, "kind": hit_kind, "level": plevel, "sheet": sheet,
-                         "x0": x0, "x1": x1, "top": top, "bottom": bottom, "view": ""}
-                    if hit_kind == "elevation":
-                        h["view"] = nearest_view_title(words, h)
-                    hits[matched_code].append(h)
+    # ---- find every code on every drawing page
+    hits = defaultdict(list)
+    runs_cache = {}
+    for i in range(1, n_pages + 1):
+        c = Counter(re.findall(r"\bA\d{3}\b", texts[i]))
+        sheet = c.most_common(1)[0][0] if c else ""
+        is_sched = i in sched_pages
+        kind, plevel = classify_page(texts[i], sheet) if not is_sched else ("schedule", "")
+        n_here = 0
+        if not is_sched and code_re is not None:
+            pg = doc[i - 1]
+            try:
+                found = find_code_boxes(pg, code_re, code_map)
+                if found and kind == "other":
+                    kind = "elevation"
+                if found:
+                    runs = page_runs(pg)[0] if kind == "elevation" else []
+                for code, box in found:
+                    n_here += 1
+                    hits[code].append({"page": i, "kind": kind, "level": plevel, "sheet": sheet, "box": box,
+                                       "view": nearest_view_title(runs, box) if kind == "elevation" else ""})
+            finally:
+                pg.close()
+        page_rows.append({"page": i, "type": kind, "level": plevel, "sheet": sheet, "rotated": i in rotated,
+                          "chars": len(texts[i]), "codes_found": n_here})
 
-                    # If a code is found, retain the page as a candidate in diagnostics.
-                    if kind == "other":
-                        kind = "elevation"
+    blank = [p["page"] for p in page_rows if p["chars"] < 20 and p["type"] != "schedule"]
+    if blank:
+        warnings.append("No readable text on page(s) " + ", ".join(f"p{p}" for p in blank[:20]) +
+                        " (scanned or outlined drawings). Signs on those pages can't be found automatically.")
 
-            page_rows.append({"page": i, "type": kind, "level": plevel, "sheet": sheet,
-                              "chars": len(texts[i]), "codes_found": n_codes_here})
+    # ---- rows, snippets, checks
+    snips, out_rows = {}, []
+    page_dims = {}
+    for r in rows:
+        code, level = r["code"], r["level"]
+        elev = [h for h in hits[code] if h["kind"] == "elevation"]
+        plan = [h for h in hits[code] if h["kind"] == "plan" and h["level"] == level]
+        other_plan = [h for h in hits[code] if h["kind"] == "plan" and h["level"] != level]
+        pages_found = sorted({(h["page"], h["kind"], h["sheet"] or h["level"]) for h in hits[code]})
 
-        crop_cache, snips, out_rows = {}, {}, []
+        chosen = [(h, "elevation") for h in elev[:elev_n]]
+        if incl_plan and plan:
+            chosen.append((plan[0], "plan"))
+        if not chosen and hits[code]:             # code exists on a drawing we couldn't classify - still show it
+            chosen = [(hits[code][0], hits[code][0]["kind"])]
+        lst = []
+        for h, k in chosen:
+            pg = doc[h["page"] - 1]
+            try:
+                hw, hh = (ehw, ehh) if k == "elevation" else (phw, phh)
+                cx, cy = (h["box"][0] + h["box"][2]) / 2, (h["box"][1] + h["box"][3]) / 2
+                png = crop_png(pg, (cx, cy), hw, hh, scale, [h["box"]])
+            finally:
+                pg.close()
+            lst.append({"kind": k, "page": h["page"], "sheet": h["sheet"], "view": h["view"],
+                        "label": f"{k} p{h['page']} {h['sheet']} {h['view']}".strip(), "png": png})
+        snips[f"{level}|{code}"] = lst
 
-        def get_crop(h, hw, hh):
-            key = (h["page"], round(h["x0"]), round(h["top"]), hw, hh, dpi)
-            if key not in crop_cache:
-                crop_cache[key] = render_crop(pdf.pages[h["page"] - 1], h, hw, hh, dpi)
-            return crop_cache[key]
-
-        for r in rows:
-            code, level = r["code"], r["level"]
-            elev = [h for h in hits[code] if h["kind"] == "elevation"]
-            plan = [h for h in hits[code] if h["kind"] == "plan" and h["level"] == level]
-            pages_found = sorted({(h["page"], h["kind"], h["sheet"] or h["level"]) for h in hits[code]})
-
-            # Prefer genuine elevation sheets with a nearby view title over incidental
-            # references elsewhere in the pack. Stable page order breaks ties.
-            elev = sorted(elev, key=lambda h: (0 if h.get("view") else 1,
-                                                0 if h.get("sheet", "").startswith(("A4", "A5")) else 1,
-                                                h["page"]))
-            chosen = [(h, "elevation") for h in elev[:elev_n]]
-            if incl_plan and plan:
-                chosen.append((plan[0], "plan"))
-            snips[f"{level}|{code}"] = [{
-                "kind": k, "page": h["page"], "sheet": h["sheet"], "view": h["view"],
-                "label": f"{k} p{h['page']} {h['sheet']} {h['view']}".strip(),
-                "png": get_crop(h, ehw, ehh) if k == "elevation" else get_crop(h, phw, phh),
-            } for h, k in chosen]
-
-            pos = []
-            if plan:
-                pos.append(f"{level} plan")
-            seen = set()
-            for h in elev:
-                label = f"{h['sheet']} {h['view']}".strip()
-                if label and label not in seen:
-                    seen.add(label)
-                    pos.append(label)
-            n_plan = len(plan)
-            if n_plan == 0:
-                plan_check = "not tagged on plan"
-            elif n_plan == r["qty"]:
-                plan_check = "OK"
-            else:
-                plan_check = f"plan shows {n_plan}"
-            issues = []
-            if not hits[code]:
-                issues.append("code not found on any drawing")
-            if n_plan and n_plan != r["qty"]:
-                issues.append("qty differs from plan")
-
-            out_rows.append({**r, "size_name": size_from_name(r["desc"]),
-                             "position": "; ".join(pos[:4]), "plan_check": plan_check,
-                             "check": "; ".join(issues),
-                             "pages": ", ".join(f"p{p} {k} {s}".strip() for p, k, s in pages_found)})
-
+        pos = []
+        if plan:
+            pos.append(f"{level} plan")
+        seen = set()
+        for h in elev:
+            label = f"{h['sheet']} {h['view']}".strip()
+            if label and label not in seen:
+                seen.add(label)
+                pos.append(label)
+        n_plan = len(plan)
+        if n_plan == 0:
+            plan_check = "not tagged on plan"
+        elif n_plan == r["qty"]:
+            plan_check = "OK"
+        else:
+            plan_check = f"plan shows {n_plan}"
+        issues = []
+        if not hits[code]:
+            issues.append("code not found on any drawing")
+        elif not elev:
+            issues.append("no elevation found" + (" (found on plan only)" if plan or other_plan else ""))
+        if n_plan and n_plan != r["qty"]:
+            issues.append("qty differs from plan")
+        out_rows.append({**r, "size_name": size_from_name(r["desc"]), "position": "; ".join(pos[:4]),
+                         "plan_check": plan_check, "check": "; ".join(issues),
+                         "pages": ", ".join(f"p{p} {k} {s}".strip() for p, k, s in pages_found)})
+    doc.close()
     return {
-        "rows": out_rows, "snips": snips, "unmatched": unmatched, "notes": notes,
+        "rows": out_rows, "snips": snips, "unmatched": unmatched, "notes": notes, "warnings": warnings,
         "pages": page_rows, "schedule_pages": sched_pages, "fallback": fallback,
         "hits": [{"code": c, **{k: v for k, v in h.items() if k in ("page", "kind", "level", "sheet", "view")}}
-                 for c, hl in hits.items() for h in hl]
+                 for c, hl in hits.items() for h in hl],
     }
 
 
 analyse = st.cache_data(show_spinner="Reading drawing pack...")(_analyse)
+
+
+# --------------------------------------------------------------------------------------
+# M&S analysis (client drawing binder: signs are red callouts on plans and elevations)
+# --------------------------------------------------------------------------------------
+MS_SIGN_RE = re.compile(
+    r"\bSIGN(?:S|AGE)?\b|LIGHT ?BOX|\bVINYLS?\b|\bUPC\b|ARTWORK REF|\bFASCIA\b|\bGOBO\b|MANIFESTATION|DIRECTORY|TOTEM|"
+    r"QUALIFI?ER|LETTERING|NOTICE ?BOARD|HISTORY WALL|\bBANNER\b|ROUNDEL|NAVIGATIONAL|PUSH THROUGH|\bHALO\b|"
+    r"\bHUB\b|WELCOME WALL|MEDIA SCREEN", re.I)
+MS_NOISE_RE = re.compile(
+    r"COPYRIGHT|DO NOT SCALE|REPRODUCED|ALL DIMENSIONS|FIRE (?:DOOR|ACTION|EXTINGUISHER|ESCAPE|STRATEGY)|ISO ?\d{4}|"
+    r"EMERGENCY|EXIT SIGN|SIGNS AND SIGNALS|WARNING SIGN|SIGN CODE|KEY COMMENTS|UPDATED IN ACCORDANCE|"
+    r"REVISED CONSTRUCTION|ISSUED AS PART|SIGN HEIGHT|MANDATORY|LUMINOUS|ASBESTOS|PLEASE REFER TO ELEVATION|"
+    r"SIGNAGE KEY|DESCRIPTION CHECKED|TENDER ISSUE|CONSTRUCTION ISSUE|FIRST ISSUE|SIGN\s*[:=]|RELOCATED TO AVOID|"
+    r"MEDIA SCREEN|^(?:GROUND|FIRST|BASEMENT) FLOOR\b|SIGNED OFF|FIRE HOSE|QUALIFIER DETAIL|DETAIL\.? ?\d? ?: ?\d+|"
+    r"MERCHANDISER|TILL ASSISTED|ASSISTED (?:WRAP|TILL)|ACC UNIT|TILL END|CARD/CARD|CARD AND CASH TILL|\bUNIT\b.{0,25}UPC|"
+    r"NOT TO EXCEED|SIZE TO BE CONFIRMED ON SITE\)? POWER", re.I)
+MS_LEGEND_RE = re.compile(
+    r"^(?:ILLUMINATED SIGN|NON-ILLUMINATED SIGN / ARTWORK|LIGHTBOX|MID FLOOR (?:ILLUMINATED|DIRECTIONAL) SIGNS?.*|"
+    r"SUPPLEMENTARY SIGNAGE|DOOR VINYLS ARTWORK DETAILS.*|EXISTING MANIFESTATIONS REPLACED.*|EXAMPLE - MID FLOOR SIGNAGE)$", re.I)
+MS_STOP = set("A AN AND AS AT BE BY FOR FROM IN IS IT OF ON OR TO THE WITH ALL NEW REFER DRAWING DETAILS FURTHER SIGN SIGNAGE "
+              "ILLUMINATED SIGNS MOUNTED WALL ARTWORK REF AI TBC PLAN UPC APPLIED GRAPHICS".split())
+LEVEL_NAMES = {"B": "Basement", "GF": "Ground floor", "FF": "First floor"}
+
+
+def sentence_case(t):
+    if t.isupper():
+        t = t.lower().capitalize()
+        t = re.sub(r"\b(upc|affl|led|leds|bu|ffl|ai|eas|ral)\b", lambda m: m.group(1).upper(), t)
+        t = t.replace("m&s", "M&S")
+    return t
+
+
+def ms_cluster(runs):
+    runs = [r for r in runs if not (r["y1"] - r["y0"] > 1.6 * (r["x1"] - r["x0"]) and len(r["t"]) > 3)]  # skip vertical text
+    n = len(runs)
+    par = list(range(n))
+
+    def f(a):
+        while par[a] != a:
+            par[a] = par[par[a]]
+            a = par[a]
+        return a
+
+    order = sorted(range(n), key=lambda i: runs[i]["y0"])
+    for ii, i in enumerate(order):
+        a = runs[i]
+        for j in order[ii + 1: ii + 70]:
+            b = runs[j]
+            h = max(a["h"], b["h"])
+            if b["y0"] - a["y1"] > 0.9 * h:
+                break
+            if abs(a["h"] - b["h"]) > 0.45 * h:
+                continue
+            gap = b["y0"] - a["y1"]
+            if gap < -0.6 * h:
+                continue
+            if (abs(a["x0"] - b["x0"]) < 1.2 * h or abs((a["x0"] + a["x1"]) / 2 - (b["x0"] + b["x1"]) / 2) < 1.2 * h
+                    or abs(a["x1"] - b["x1"]) < 1.2 * h):
+                par[f(i)] = f(j)
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[f(i)].append(runs[i])
+    out = []
+    for g in groups.values():
+        g.sort(key=lambda r: (r["y0"], r["x0"]))
+        out.append({"text": re.sub(r"\s+", " ", runs_to_text(g).replace("\n", " ")).strip(),
+                    "x0": min(r["x0"] for r in g), "y0": min(r["y0"] for r in g),
+                    "x1": max(r["x1"] for r in g), "y1": max(r["y1"] for r in g), "h": g[0]["h"]})
+    return out
+
+
+def ms_title(runs, dw, dh):
+    """Drawing title + number from the title block (bottom-right of the sheet)."""
+    tb = [r for r in runs if r["x0"] > 0.55 * dw and r["y0"] > 0.62 * dh]
+    cl = ms_cluster(tb)
+    bad = re.compile(r"COPYRIGHT|REPRODUCED|HALLIDAY|CONSTRUCTION|DUNDRUM|IRELAND|NOTES|ARCHITECTURE|ISSUE|KEY COMMENTS|"
+                     r"UPDATED|DESCRIPTION|PROJECT|CONSULTANT|REVISED|AS INDICATED|^[A-Z]{3,4} ?\d{2}$|\d{2}\.\d{2}\.\d{2}", re.I)
+    kw = re.compile(r"signage|elevation|plan|details|layout|finishes|schedule|setting|section|till|door", re.I)
+    c = [x for x in cl if 6 < len(x["text"]) <= 72 and not bad.search(x["text"]) and kw.search(x["text"])]
+    title = max(c, key=lambda x: x["h"])["text"] if c else ""
+    num = ""
+    dums = [r for r in tb if re.fullmatch(r"DUM\d+ ?[A-Z]?", r["t"])]
+    nums = [r for r in tb if re.fullmatch(r"\d{5}", r["t"])]
+    if nums:
+        ref = dums[0] if dums else nums[0]
+        num = [r["t"] for r in sorted(nums, key=lambda r: math.hypot(r["x0"] - ref["x0"], r["y0"] - ref["y0"]))]
+    return title, num
+    return title, num
+
+
+def ms_level(title, text):
+    t = (title or "").lower()
+    for key, lv in (("basement", "B"), ("boh", "B"), ("ground", "GF"), ("foodhall", "GF"), ("food hall", "GF"), ("first", "FF")):
+        if key in t:
+            return lv
+    if re.match(r"^ff\b", t):
+        return "FF"
+    if re.match(r"^gf\b", t):
+        return "GF"
+    return ""
+
+
+def ms_page_kind(title, text):
+    t = (title or "").lower()
+    if "signage" in t or "signage key" in text.lower():
+        return "plan"
+    if re.search(r"elevation|till details|till hanger|section|setting out|manifestation", t):
+        return "elevation"
+    return "other"
+
+
+def ms_parse(text):
+    t = text
+    refs = []
+    for m in re.finditer(r"UPC:?\s*(\d{6,8})", t, re.I):
+        refs.append(f"UPC {m.group(1)}")
+    art = None
+    m = re.search(r"ARTWORK\s*REF:?\s*(.+?\.\s*AI)\b", t, re.I)
+    if m:
+        art = re.sub(r"\s+", "", m.group(1))
+        refs.append("Art " + art)
+    for m in re.finditer(r"DRAWING\s+(\d{5})", t, re.I):
+        refs.append(f"Dwg {m.group(1)}")
+    for m in re.finditer(r"\b(SDD-\d+)\b", t, re.I):
+        refs.append(m.group(1).upper())
+
+    size = ""
+    m = re.search(r"(\d{2,4})\s*(?:mm)?\s*[xX\u00d7]\s*(\d{2,4})\s*mm", t)
+    if m:
+        size = f"{m.group(1)} x {m.group(2)}mm"
+    elif art and re.match(r"(\d{2,4})x(\d{2,4})[-_]", art, re.I):
+        a = re.match(r"(\d{2,4})x(\d{2,4})", art, re.I)
+        size = f"{a.group(1)} x {a.group(2)} (artwork ref)"
+    else:
+        m = re.search(r"(?<![+\d])(\d{2,4})\s*mm\s+HIGH", t, re.I)
+        if m:
+            size = f"{m.group(1)}mm high"
+        else:
+            m = re.search(r"(?<![+\d.])(\d{2,4})\s*mm\b(?!\s*(?:AFFL|AFL|FFL|THICK|BACK|FROM|TO U/S|OFF))", t, re.I)
+            if m and m.group(1) not in ("150",) or (m and "HUNG" not in t[max(0, m.start() - 5):m.start()].upper()):
+                size = f"{m.group(1)}mm"
+    ffl = ""
+    m = re.search(r"(\d{3,4})\s*mm\s*(AFFL|AFL|FFL)", t, re.I)
+    if m:
+        ffl = f"{m.group(1)}mm {m.group(2).upper()}"
+    else:
+        m = re.search(r"\+\s*(\d{3,4})\s*mm\s*TO U/S", t, re.I)
+        if m:
+            ffl = f"+{m.group(1)}mm to underside"
+    m = re.search(r"\(?\b(\d{1,3})\s*NO\b\.?\)?", t, re.I)
+    stated = int(m.group(1)) if m else None
+
+    flags = []
+    if re.search(r"\bTB[CS]\b|TO BE CONFIRMED|SITE SIZED|SIZE TO BE|HEIGHT OF LETTER", t, re.I):
+        flags.append("size/details TBC")
+    if re.search(r"BY M&S|PROVIDED BY M&S|M&S MARKETING|ARTWORK DETAILS", t, re.I):
+        flags.append("artwork by M&S")
+    if re.search(r"TO BE ADDED|ON HOLD|AWAITING|CONFIRM LOCATIONS", t, re.I):
+        flags.append("not yet defined")
+    existing = bool(re.search(r"\bEXISTING\b|TO REMAIN|RE-?USE|RETAIN", t, re.I)) and not re.search(r"\bNEW\b", t, re.I)
+    return {"refs": refs, "size": size, "ffl": ffl, "stated": stated, "flags": flags, "existing": existing}
+
+
+def ms_tokens(t):
+    return {w for w in re.findall(r"[A-Z0-9']{3,}", t.upper()) if w not in MS_STOP and not w.isdigit()}
+
+
+MS_ADJ = set("ILLUMINATED BESPOKE HIGH WALL MOUNTED NEW HANGING NON NON-ILLUMINATED MID FLOOR FIXED FRAME AND THE A OF TO BE ON".split()) - {"ON"}
+
+
+def ms_name(t):
+    """Short name of a sign: the 1-3 words before SIGN/SIGNAGE (e.g. TRY ON, PAY HERE, LIFT)."""
+    toks = re.findall(r"[A-Z&']+", re.sub(r"\d+\s*MM|\d+", " ", t.upper()))
+    toks = [w.strip("'") for w in toks]
+    for i, w in enumerate(toks):
+        if w in ("SIGN", "SIGNAGE") and i:
+            name = []
+            for x in reversed(toks[max(0, i - 4):i]):
+                if x in MS_ADJ or x in ("HIGH",):
+                    if name:
+                        break
+                    continue
+                name.append(x)
+            if name:
+                return " ".join(reversed(name))
+    return ""
+
+
+def ms_norm(t):
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", "", t.upper())).strip()
+
+
+def _ms_scan(pdf_bytes):
+    """Read every page: title, drawing no., level, kind and sign callouts (text only - fast)."""
+    doc = pdfium.PdfDocument(pdf_bytes)
+    pages, items, nums_seen = [], [], Counter()
+    for i in range(1, len(doc) + 1):
+        pg = doc[i - 1]
+        try:
+            runs, dw, dh = page_runs(pg)
+            text = " ".join(r["t"] for r in runs)
+            title, num = ms_title(runs, dw, dh)
+            kind = ms_page_kind(title, text)
+            level = ms_level(title, text)
+            n = 0
+            if kind in ("plan", "elevation"):
+                for c in ms_cluster(runs):
+                    t = c["text"]
+                    if len(t) < 5 or c["x0"] > 0.83 * dw or not MS_SIGN_RE.search(t):
+                        continue
+                    if MS_NOISE_RE.search(t) or MS_LEGEND_RE.match(t.strip()) or t.strip().lower() == title.lower():
+                        continue
+                    if c["x0"] < 0.13 * dw and len(t) < 60 and re.search(r"KEY|EXAMPLE|NOTE", t, re.I):
+                        continue
+                    if len(t) > 420:
+                        continue
+                    n += 1
+                    items.append({"page": i, "kind": kind, "level": level, "dwg": num, "title": title,
+                                  "text": t, "box": (c["x0"], c["y0"], c["x1"], c["y1"]), "dw": dw, "dh": dh,
+                                  "view": nearest_view_title([r for r in runs if "elevation" in r["t"].lower()],
+                                                             (c["x0"], c["y0"], c["x1"], c["y1"])) if kind == "elevation" else ""})
+            pages.append({"page": i, "type": kind, "level": level, "dwg": num, "title": title[:70], "callouts": n})
+            nums_seen.update(num[:1] if isinstance(num, list) else [])
+        except Exception as e:
+            pages.append({"page": i, "type": "error", "level": "", "dwg": "", "title": str(e)[:60], "callouts": 0})
+        finally:
+            pg.close()
+    doc.close()
+    # the consultant project number repeats on every sheet - the drawing number is the other 5-digit value
+    proj = nums_seen.most_common(1)[0][0] if nums_seen else ""
+    for p in pages:
+        if isinstance(p["dwg"], list):
+            p["dwg"] = next((n for n in p["dwg"] if n != proj), "")
+    for it in items:
+        d = next((p["dwg"] for p in pages if p["page"] == it["page"]), "")
+        it["dwg"] = d
+    return {"pages": pages, "items": items}
+
+
+ms_scan = st.cache_data(show_spinner="Reading binder...")(_ms_scan)
+
+
+
+def _analyse_ms(pdf_bytes, include_pages, wpct, hpct, incl_plan, incl_elev):
+    sc = ms_scan(pdf_bytes)
+    pages = sc["pages"]
+    auto = {p["page"] for p in pages if p["type"] in ("plan", "elevation") and p["callouts"]}
+    sel = set(include_pages) if include_pages else auto
+    items = [it for it in sc["items"] if it["page"] in sel] if include_pages else [it for it in sc["items"] if it["page"] in sel]
+
+    # ---- group identical callouts (same sign called out on several plans / floors)
+    groups = []
+    for it in sorted(items, key=lambda x: (x["page"], x["box"][1], x["box"][0])):
+        it["norm"] = ms_norm(it["text"])
+        g = next((g for g in groups if g["kind_class"] == (it["kind"] == "plan")
+                  and (g["norm"] == it["norm"] or difflib.SequenceMatcher(None, g["norm"], it["norm"]).ratio() >= 0.9)), None)
+        if g is None:
+            g = {"norm": it["norm"], "text": it["text"], "kind_class": it["kind"] == "plan", "items": []}
+            groups.append(g)
+        g["items"].append(it)
+
+    plan_groups = [g for g in groups if g["kind_class"]]
+    elev_groups = [g for g in groups if not g["kind_class"]]
+
+    # ---- link elevation callouts to plan signs by shared distinctive words
+    for g in plan_groups:
+        tk = ms_tokens(g["text"])
+        best, best_s = None, 0.0
+        nm = ms_name(g["text"])
+        for e in elev_groups:
+            te = ms_tokens(e["text"])
+            if not tk or not te:
+                continue
+            sh = len(tk & te)
+            sc_ = sh / min(len(tk), len(te))
+            lv_ok0 = (not e["items"][0]["level"])
+            if nm and ms_name(e["text"]) == nm and (lv_ok0 or not g["items"][0]["level"] or e["items"][0]["level"] == g["items"][0]["level"]
+                                                       or True):
+                best, best_s = e, 9.0 if best_s < 9.0 else best_s
+                continue
+            lv_ok = (not e["items"][0]["level"]) or (not g["items"][0]["level"]) or e["items"][0]["level"] == g["items"][0]["level"]
+            if lv_ok and sh >= 2 and sc_ >= 0.6 and sc_ > best_s:
+                best, best_s = e, sc_
+        g["elev_link"] = best
+        if best is not None:
+            best["linked"] = True
+    elev_only = [e for e in elev_groups if not e.get("linked")]
+
+    # ---- rows
+    def rank(g):
+        it = g["items"][0]
+        return ({"B": 0, "GF": 1, "FF": 2}.get(it["level"], 3), it["page"], it["box"][1], it["box"][0])
+
+    seq = Counter()
+    rows, snips = [], {}
+    doc = pdfium.PdfDocument(pdf_bytes)
+    page_cache = {}
+
+    def getpage(n):
+        if n not in page_cache:
+            page_cache[n] = doc[n - 1]
+        return page_cache[n]
+
+    def snippet(it, kind):
+        pg = getpage(it["page"])
+        hw, hh = wpct * it["dw"], hpct * it["dw"]
+        scale = max(0.4, min(3.0, 1000.0 / (2 * hw)))
+        cx, cy = (it["box"][0] + it["box"][2]) / 2, (it["box"][1] + it["box"][3]) / 2
+        return {"kind": kind, "page": it["page"], "sheet": it["dwg"], "view": it["view"] or it["title"][:40],
+                "label": f"{kind} p{it['page']} {it['dwg']} {it['view'] or it['title'][:40]}".strip(),
+                "png": crop_png(pg, (cx, cy), hw, hh, scale, [it["box"]])}
+
+    for g in sorted(plan_groups + elev_only, key=rank):
+        its = g["items"]
+        p = ms_parse(g["text"])
+        if g["kind_class"] and g.get("elev_link"):
+            pe = ms_parse(g["elev_link"]["text"])
+            for k in ("size", "ffl"):
+                if not p[k] and pe[k]:
+                    p[k] = pe[k]
+            if p["size"] and pe["size"] and re.findall(r"\d+", p["size"])[:1] != re.findall(r"\d+", pe["size"])[:1]:
+                p["flags"] = p["flags"] + [f"size differs: plan {p['size']} / elevation {pe['size']}"]
+            p["refs"] += [r for r in pe["refs"] if r not in p["refs"]]
+        levels = []
+        for it in its:
+            if it["level"] and it["level"] not in levels:
+                levels.append(it["level"])
+        levels = sorted(levels, key=lambda l: {"B": 0, "GF": 1, "FF": 2}.get(l, 3))
+        prefix = (levels[0] if levels else "EL") if g["kind_class"] else "EL"
+        seq[prefix] += 1
+        code = f"{prefix}-{seq[prefix]:02d}"
+        n_plan = len(its) if g["kind_class"] else 0
+        per_page = Counter(it["page"] for it in its)
+        counted = n_plan if g["kind_class"] else max(per_page.values())
+        qty = p["stated"] if (p["stated"] and counted == 1) else counted
+        per_level = Counter(it["level"] or "?" for it in its)
+        pos_bits = []
+        if g["kind_class"]:
+            pos_bits.append(", ".join(f"{LEVEL_NAMES.get(l, l)} x{n}" for l, n in per_level.items()))
+        if g.get("elev_link"):
+            pos_bits.append("elev: " + g["elev_link"]["items"][0]["view"] if g["elev_link"]["items"][0]["view"] else "elevation")
+        if not g["kind_class"]:
+            pos_bits.append(its[0]["view"] or its[0]["title"])
+        issues = []
+        if not p["size"]:
+            issues.append("no size on callout")
+        if p["existing"]:
+            issues.append("existing / retained")
+        issues += p["flags"]
+        if g["kind_class"] and not g.get("elev_link"):
+            issues.append("no matching elevation callout")
+        if not g["kind_class"]:
+            issues.append("elevation only - not on a signage plan")
+        pages_txt = sorted({(it["page"], it["kind"], it["dwg"]) for it in its})
+        if g.get("elev_link"):
+            pages_txt += sorted({(it["page"], "elevation", it["dwg"]) for it in g["elev_link"]["items"]})
+        r = {"level": ", ".join(levels) if levels else "-", "code": code, "desc": sentence_case(g["text"]),
+             "qty": int(qty), "mod": "; ".join(p["refs"]), "sched_page": its[0]["page"],
+             "size_name": p["size"], "ffl_name": p["ffl"], "position": "; ".join(pos_bits),
+             "plan_check": (f"{n_plan} callout(s) on plans" if g["kind_class"] else f"{counted} callout(s) on elevations"),
+             "check": "; ".join(issues),
+             "pages": ", ".join(f"p{a} {b} {c}".strip() for a, b, c in pages_txt)}
+        rows.append(r)
+
+        lst = []
+        if incl_plan and g["kind_class"]:
+            lst.append(snippet(its[0], "plan"))
+        if incl_elev:
+            src = g["elev_link"]["items"][0] if g.get("elev_link") else (its[0] if not g["kind_class"] else None)
+            if src is not None:
+                lst.append(snippet(src, "elevation"))
+        snips[f"{r['level']}|{code}"] = lst
+        r["key"] = f"{r['level']}|{code}"
+
+    for pg in page_cache.values():
+        pg.close()
+    doc.close()
+    warnings = []
+    if not rows:
+        warnings.append("No sign callouts found on the selected pages.")
+    return {"rows": rows, "snips": snips, "unmatched": [], "notes": [], "warnings": warnings,
+            "pages": pages, "schedule_pages": [], "fallback": False, "hits": [], "selected": sorted(sel)}
+
+
+analyse_ms = st.cache_data(show_spinner="Building M&S schedule...")(_analyse_ms)
 
 
 # --------------------------------------------------------------------------------------
@@ -372,8 +794,8 @@ def vision_read(client, model, png: bytes, row: dict, notes: list):
     return json.loads(text[a:b + 1])
 
 
-COLS = ["Level", "Sign Code", "Description", "Size (name)", "Size (drawing)", "Position",
-        "FFL", "Qty", "Plan check", "Check", "MOD", "Read confidence", "Evidence"]
+COLS = ["Level", "Sign Code", "Description", "Size (text)", "Size (drawing)", "Position",
+        "FFL", "Qty", "Plan check", "Check", "MOD / Ref", "Read confidence", "Evidence"]
 
 
 def build_df(res, vision):
@@ -381,16 +803,16 @@ def build_df(res, vision):
     out = []
     for r in res["rows"]:
         v = vision.get(f"{r['level']}|{r['code']}", {})
-        ffl = v.get("ffl") or ""
+        ffl = v.get("ffl") or r.get("ffl_name", "")
         if not ffl and "hanging" in r["desc"].lower() and hang_note:
             ffl = f"per note: {hang_note}"
         if v.get("tbc"):
             ffl = f"{ffl} [{v['tbc']}]".strip()
         out.append({
             "Level": r["level"], "Sign Code": r["code"], "Description": r["desc"],
-            "Size (name)": r["size_name"], "Size (drawing)": v.get("size") or "",
+            "Size (text)": r["size_name"], "Size (drawing)": v.get("size") or "",
             "Position": r["position"], "FFL": ffl, "Qty": r["qty"], "Plan check": r["plan_check"],
-            "Check": r["check"], "MOD": r["mod"], "Read confidence": v.get("confidence") or "",
+            "Check": r["check"], "MOD / Ref": r["mod"], "Read confidence": v.get("confidence") or "",
             "Evidence": v.get("evidence") or "",
         })
     return pd.DataFrame(out, columns=COLS)
@@ -487,7 +909,7 @@ def build_pdf(df, snips, source_name="", summary=True) -> bytes:
         data = [[P(h, cellb) for h in head]]
         for _, r in df.iterrows():
             data.append([P(r["Level"]), P(r["Sign Code"], cellb), P(r["Description"]),
-                         P(r["Size (drawing)"] or r["Size (name)"]), P(r["FFL"]), P(r["Qty"]),
+                         P(r["Size (drawing)"] or r["Size (text)"]), P(r["FFL"]), P(r["Qty"]),
                          P(r["Position"]), P(r["Check"] or r["Plan check"])])
         t = Table(data, colWidths=[28, 60, 190, 100, 112, 26, 150, 120], repeatRows=1)
         t.setStyle(TableStyle([
@@ -509,7 +931,7 @@ def build_pdf(df, snips, source_name="", summary=True) -> bytes:
         story.append(Paragraph(f"{escape(r['Sign Code'])} &nbsp;&nbsp;<font size=11 color='#555555'>"
                                f"{escape(r['Level'])} &nbsp;|&nbsp; Qty {r['Qty']}</font>", h1))
         story.append(Paragraph(escape(r["Description"]), h2))
-        size = r["Size (drawing)"] or r["Size (name)"] or "-"
+        size = r["Size (drawing)"] or r["Size (text)"] or "-"
         def F(label, value):
             return Paragraph(f"<b>{label}:</b> {escape(str(value))}", fact)
         facts = Table([[F("Size", size), F("FFL", r["FFL"] or "-")],
@@ -532,7 +954,6 @@ def build_pdf(df, snips, source_name="", summary=True) -> bytes:
             story.append(it)
         if n < n_rows:
             story.append(PageBreak())
-
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
     return buf.getvalue()
 
@@ -553,12 +974,10 @@ def run_vision(res, keys, api_key, model, state):
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     by_key = {f"{r['level']}|{r['code']}": r for r in res["rows"]}
-    if not keys:
-        st.info("There are no signs with elevation snippets to read.")
-        return
     bar = st.progress(0.0, text="Reading drawings...")
     for n, key in enumerate(keys, 1):
-        snips = [s for s in res["snips"].get(key, []) if s["kind"] == "elevation"]
+        snips = res["snips"].get(key, [])
+        snips = [s for s in snips if s["kind"] == "elevation"] or snips
         if snips and key not in state:
             try:
                 state[key] = vision_read(client, model, snips[0]["png"], by_key[key], res["notes"])
@@ -568,122 +987,108 @@ def run_vision(res, keys, api_key, model, state):
     bar.empty()
 
 
-def tk_mode():
-    with st.sidebar:
-        st.header("Settings")
-        elev_n = st.slider("Elevation snippets per sign", 1, 3, 1)
-        incl_plan = st.checkbox("Also include a plan snippet", value=True)
-        ehw = st.slider("Elevation crop half-width (pt)", 50, 600, 220, 10)
-        ehh = st.slider("Elevation crop half-height (pt)", 50, 600, 160, 10)
-        phw = st.slider("Plan crop half-width (pt)", 50, 600, 150, 10)
-        phh = st.slider("Plan crop half-height (pt)", 50, 600, 110, 10)
-        dpi = st.select_slider("Snippet resolution (dpi)", options=[100, 150, 200, 250], value=150)
-        st.divider()
-        st.subheader("Vision read (optional)")
-        api_key = get_api_key() or st.text_input("Anthropic API key", type="password")
-        model = st.text_input(
-            "Anthropic model ID",
-            value=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
-            help="Use a model ID enabled for your Anthropic account; can also be set with ANTHROPIC_MODEL."
-        )
+def vision_sidebar():
+    st.divider()
+    st.subheader("Vision read (optional)")
+    api_key = get_api_key() or st.text_input("Anthropic API key", type="password")
+    model = st.selectbox("Model", ["claude-haiku-5-5", "claude-sonnet-5-5"])
+    return api_key, model
 
-    up = st.file_uploader("Upload the TK Maxx drawing pack (PDF)", type=["pdf"], key="tk_pdf")
-    if not up:
-        st.info("Upload a pack to get the schedule, one page per sign, and a check sheet.")
-        return
 
-    pdf_bytes = up.getvalue()
-    file_id = hashlib.md5(pdf_bytes).hexdigest()
-    try:
-        res = analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi)
-    except Exception as e:
-        st.error(f"Couldn't read that PDF: {e}")
-        return
-
+def show_results(res, up_name, file_id, mode, api_key, model):
+    for w in res.get("warnings", []):
+        st.warning(w)
     if not res["rows"]:
-        st.error("No schedule rows found. Check this is the TK drawing pack with the 'TK Code / Family and Type' schedule.")
+        st.error("Nothing found. Check you've uploaded the right pack for this mode.")
         return
-    if res["fallback"]:
-        st.warning("No schedule page recognised - scanned every page for rows instead. Check results carefully.")
 
     vstore = st.session_state.setdefault("vision", {})
-    vision = vstore.setdefault(file_id, {})
-    df = build_df(res, vision)
+    vision = vstore.setdefault(f"{mode}:{file_id}", {})
+    df_all = build_df(res, vision)
+    df_all["_key"] = [r.get("key") or f"{r['level']}|{r['code']}" for r in res["rows"]]
+
+    dropped = st.session_state.setdefault("dropped", {}).setdefault(f"{mode}:{file_id}", [])
+    df = df_all[~df_all["Sign Code"].isin(dropped)].reset_index(drop=True)
+    snips = {k: v for k, v in res["snips"].items() if k in set(df["_key"])}
+    df = df.drop(columns=["_key"])
+    res_view = {**res, "rows": [r for r in res["rows"] if r["code"] not in dropped], "snips": snips}
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Signs", len(df))
     c2.metric("Total qty", int(df["Qty"].sum()))
-    c3.metric("With snippets", sum(1 for k, v in res["snips"].items() if v))
+    c3.metric("With snippets", sum(1 for v in snips.values() if v))
     c4.metric("Flagged", int((df["Check"] != "").sum()))
 
     t_sched, t_signs, t_check = st.tabs(["Schedule", "Sign by sign", "Check sheet"])
 
-    # ---- Schedule
     with t_sched:
         st.dataframe(df, use_container_width=True, hide_index=True)
+        new_drop = st.multiselect("Remove rows that aren't real signs (removed from every export)",
+                                  list(df_all["Sign Code"]), default=dropped,
+                                  format_func=lambda c: f"{c}  -  {df_all.loc[df_all['Sign Code'] == c, 'Description'].iloc[0][:70]}")
+        if new_drop != dropped:
+            st.session_state["dropped"][f"{mode}:{file_id}"] = new_drop
+            st.rerun()
         d1, d2, d3, d4 = st.columns(4)
-        d1.download_button("Excel (with snippets)", build_xlsx(df, res["snips"]),
-                           f"signage_schedule.xlsx",
+        d1.download_button("Excel (with snippets)", build_xlsx(df, snips), "signage_schedule.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        d2.download_button("PDF (one page per sign)", build_pdf(df, res["snips"], up.name),
-                           "signage_schedule.pdf", "application/pdf")
-        d3.download_button("Snippets (zip)", build_zip(res["snips"]), "snippets.zip", "application/zip")
+        d2.download_button("PDF (one page per sign)", build_pdf(df, snips, up_name), "signage_schedule.pdf",
+                           "application/pdf")
+        d3.download_button("Snippets (zip)", build_zip(snips), "snippets.zip", "application/zip")
         d4.download_button("CSV", df.to_csv(index=False).encode("utf-8"), "signage_schedule.csv", "text/csv")
-
         st.divider()
         if api_key:
-            if st.button("Read sizes / FFL from drawings (all signs)"):
-                run_vision(res, list(res["snips"].keys()), api_key, model, vision)
+            if st.button("Read sizes / FFL from the drawing snippets (all signs)", key=f"va_{mode}"):
+                run_vision(res_view, list(snips.keys()), api_key, model, vision)
                 st.rerun()
-            st.caption("Vision reads only what's drawn on the crop - always check against the evidence column.")
+            st.caption("Vision reads only what's drawn on the snippet - always check against the evidence column.")
         else:
-            st.caption("Add an Anthropic API key in the sidebar to read sizes and FFL off the drawings.")
+            st.caption("Add an Anthropic API key in the sidebar to read sizes and FFL off the snippets.")
 
-    # ---- Sign by sign
     with t_signs:
-        labels = [f"{r['Level']}  {r['Sign Code']}  -  {r['Description']}" for _, r in df.iterrows()]
-        st.session_state.setdefault("sign_idx", 0)
-        st.session_state["sign_idx"] = min(st.session_state["sign_idx"], len(labels) - 1)
-
-        def step(d):
-            st.session_state["sign_idx"] = (st.session_state["sign_idx"] + d) % len(labels)
-
-        nav1, nav2, nav3 = st.columns([1, 6, 1])
-        nav1.button("< Prev", on_click=step, args=(-1,), use_container_width=True)
-        nav3.button("Next >", on_click=step, args=(1,), use_container_width=True)
-        nav2.selectbox("Sign", range(len(labels)), format_func=lambda i: labels[i],
-                       key="sign_idx", label_visibility="collapsed")
-
-        i = st.session_state["sign_idx"]
-        r = df.iloc[i]
-        key = f"{r['Level']}|{r['Sign Code']}"
-        st.subheader(f"{r['Sign Code']}  |  {r['Level']}  |  Qty {r['Qty']}")
-        st.write(r["Description"])
-        f1, f2 = st.columns(2)
-        f1.markdown(f"**Size:** {r['Size (drawing)'] or r['Size (name)'] or '-'}")
-        f1.markdown(f"**FFL:** {r['FFL'] or '-'}")
-        f2.markdown(f"**Position:** {r['Position'] or '-'}")
-        f2.markdown(f"**Check:** {r['Check'] or r['Plan check']}")
-        if r["Evidence"]:
-            st.caption(f"Evidence: {r['Evidence']} ({r['Read confidence']} confidence)")
-
-        if api_key and st.button("Read this sign from the drawing", key=f"vr_{key}"):
-            run_vision(res, [key], api_key, model, vision)
-            st.rerun()
-
-        snips = res["snips"].get(key, [])
-        if not snips:
-            st.warning("No plan or elevation reference found for this sign.")
+        if df.empty:
+            st.info("No signs left.")
         else:
-            cols = st.columns(len(snips))
-            for col, s in zip(cols, snips):
-                col.image(s["png"], caption=s["label"], use_container_width=True)
+            labels = [f"{r['Level']}  {r['Sign Code']}  -  {r['Description'][:90]}" for _, r in df.iterrows()]
+            idx_key = f"sign_idx_{mode}"
+            st.session_state.setdefault(idx_key, 0)
+            st.session_state[idx_key] = min(st.session_state[idx_key], len(labels) - 1)
 
-    # ---- Check sheet
+            def step(d):
+                st.session_state[idx_key] = (st.session_state[idx_key] + d) % len(labels)
+
+            n1, n2, n3 = st.columns([1, 6, 1])
+            n1.button("< Prev", on_click=step, args=(-1,), use_container_width=True, key=f"prev_{mode}")
+            n3.button("Next >", on_click=step, args=(1,), use_container_width=True, key=f"next_{mode}")
+            n2.selectbox("Sign", range(len(labels)), format_func=lambda i: labels[i], key=idx_key,
+                         label_visibility="collapsed")
+            i = st.session_state[idx_key]
+            r = df.iloc[i]
+            key = f"{r['Level']}|{r['Sign Code']}"
+            st.subheader(f"{r['Sign Code']}  |  {r['Level']}  |  Qty {r['Qty']}")
+            st.write(r["Description"])
+            f1, f2 = st.columns(2)
+            f1.markdown(f"**Size:** {r['Size (drawing)'] or r['Size (text)'] or '-'}")
+            f1.markdown(f"**FFL:** {r['FFL'] or '-'}")
+            f1.markdown(f"**Ref:** {r['MOD / Ref'] or '-'}")
+            f2.markdown(f"**Position:** {r['Position'] or '-'}")
+            f2.markdown(f"**Check:** {r['Check'] or r['Plan check']}")
+            if r["Evidence"]:
+                st.caption(f"Evidence: {r['Evidence']} ({r['Read confidence']} confidence)")
+            if api_key and st.button("Read this sign from its snippet", key=f"vr_{mode}_{key}"):
+                run_vision(res_view, [key], api_key, model, vision)
+                st.rerun()
+            lst = snips.get(key, [])
+            if not lst:
+                st.warning("No plan or elevation reference found for this sign.")
+            else:
+                for col, s in zip(st.columns(len(lst)), lst):
+                    col.image(s["png"], caption=s["label"], use_container_width=True)
+
     with t_check:
         flagged = df[df["Check"] != ""]
         if flagged.empty:
-            st.success("Every sign was found on the drawings and plan quantities agree.")
+            st.success("Nothing flagged.")
         else:
             st.markdown("**Signs to look at**")
             st.dataframe(flagged[["Level", "Sign Code", "Description", "Qty", "Plan check", "Check"]],
@@ -699,10 +1104,78 @@ def tk_mode():
             st.dataframe(pd.DataFrame(res["pages"]), use_container_width=True, hide_index=True)
 
 
+def tk_mode():
+    with st.sidebar:
+        st.header("Settings")
+        elev_n = st.slider("Elevation snippets per sign", 1, 3, 1)
+        incl_plan = st.checkbox("Also include a plan snippet", value=True)
+        ehw = st.slider("Elevation crop half-width (pt)", 50, 600, 220, 10)
+        ehh = st.slider("Elevation crop half-height (pt)", 50, 600, 160, 10)
+        phw = st.slider("Plan crop half-width (pt)", 50, 600, 150, 10)
+        phh = st.slider("Plan crop half-height (pt)", 50, 600, 110, 10)
+        dpi = st.select_slider("Snippet resolution (dpi)", options=[100, 150, 200, 250], value=150)
+        api_key, model = vision_sidebar()
+
+    up = st.file_uploader("Upload the TK Maxx drawing pack (PDF)", type=["pdf"], key="tk_pdf")
+    if not up:
+        st.info("Upload a pack to get the schedule, one page per sign, and a check sheet.")
+        return
+    pdf_bytes = up.getvalue()
+    file_id = hashlib.md5(pdf_bytes).hexdigest()
+    try:
+        res = analyse(pdf_bytes, elev_n, incl_plan, ehw, ehh, phw, phh, dpi)
+    except Exception as e:
+        st.error(f"Couldn't read that PDF: {e}")
+        return
+    if not res["rows"]:
+        st.error("No schedule rows found. Check this is the TK drawing pack with the 'TK Code / Family and Type' schedule.")
+        return
+    if res["fallback"]:
+        st.warning("No schedule page recognised - scanned every page for rows instead. Check results carefully.")
+    show_results(res, up.name, file_id, "tk", api_key, model)
+
+
 def ms_mode():
-    st.info("M&S mode isn't built into this version yet. Gemini's rebuild only contains the TK Maxx extractor. "
-            "To do M&S the same way (sign per page, snippets, check sheet) I need a few pages of the M&S "
-            "binder - the schedule/legend page and one or two elevations - to see how their sign codes are laid out.")
+    with st.sidebar:
+        st.header("Settings")
+        incl_plan = st.checkbox("Plan snippet (where it is)", value=True)
+        incl_elev = st.checkbox("Elevation snippet (where one matches)", value=True)
+        wpct = st.slider("Snippet half-width (% of sheet width)", 3.0, 20.0, 9.0, 0.5) / 100
+        hpct = st.slider("Snippet half-height (% of sheet width)", 2.0, 15.0, 6.5, 0.5) / 100
+        api_key, model = vision_sidebar()
+
+    up = st.file_uploader("Upload the M&S binder (PDF)", type=["pdf"], key="ms_pdf")
+    if not up:
+        st.info("Upload the M&S binder. Signs are picked up from the red callouts on the signage plans and elevations, "
+                "counted across floors, with a plan and elevation snippet for each.")
+        return
+    pdf_bytes = up.getvalue()
+    file_id = hashlib.md5(pdf_bytes).hexdigest()
+    try:
+        scan = ms_scan(pdf_bytes)
+    except Exception as e:
+        st.error(f"Couldn't read that PDF: {e}")
+        return
+
+    pages = scan["pages"]
+    auto = [p["page"] for p in pages if p["type"] in ("plan", "elevation") and p["callouts"]]
+    by_page = {p["page"]: p for p in pages}
+    with st.expander(f"Pages being read ({len(auto)} auto-selected) - change if a sign sheet was missed or a wrong one included"):
+        sel = st.multiselect(
+            "Pages", [p["page"] for p in pages if p["type"] != "error"], default=auto,
+            format_func=lambda n: f"p{n} | {by_page[n]['dwg'] or '-'} | {by_page[n]['type']} | {by_page[n]['title'] or '(no title found)'} | {by_page[n]['callouts']} callouts")
+    if not sel:
+        st.warning("Pick at least one page.")
+        return
+    try:
+        res = analyse_ms(pdf_bytes, tuple(sorted(sel)), wpct, hpct, incl_plan, incl_elev)
+    except Exception as e:
+        st.error(f"Couldn't build the M&S schedule: {e}")
+        return
+    st.caption("M&S doesn't use sign codes, so each sign gets an ID (B / GF / FF + number; EL = only seen on an elevation). "
+               "The M&S UPC / artwork / drawing reference is in the 'MOD / Ref' column. Quantity is the number of callouts "
+               "counted on the signage plans across all floors unless a callout states a number.")
+    show_results(res, up.name, file_id, "ms", api_key, model)
 
 
 st.title("Store Signage Schedule Extractor")
