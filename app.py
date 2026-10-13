@@ -31,7 +31,7 @@ st.set_page_config(page_title="Store Signage Schedule Extractor", layout="wide")
 # Patterns
 # --------------------------------------------------------------------------------------
 CODE_PATTERN = r"(?:TK\d{2}(?:-\d{1,3}[A-Z]{0,2})?(?:-[A-Z]{1,2})?|TKM-\d+[A-Z]*|TK_[A-Za-z]+)"
-ROW_RE = re.compile(rf"^(L\d{{2}})\s+(.+?)\s+({CODE_PATTERN})\s+(\d+)\b(.*)$")
+ROW_RE = re.compile(rf"^(L\d{{2}})\s+(.+?)\s+({CODE_PATTERN})\s+(\d+)(?=\s|MOD|$)(.*)$")   # count can run straight into 'MOD6' ('1MOD6')
 
 
 # --------------------------------------------------------------------------------------
@@ -1713,10 +1713,10 @@ def ms_mode():
 # --------------------------------------------------------------------------------------
 # ---- Manual reading (Geetee Signs sheets) ----------------------------------------------------
 GT_DWG_RE = re.compile(r"\b[A-Z]{2}-\d{4}-\d{2,4}\b")
-GT_QTY_RE = re.compile(r"(\d+)\s*(?:no\.?|off|nr\.?)\s*(?:full\s+)?(sets?|each|pairs?|panels?)?\s*(?:required|req\.?|total)?", re.I)
+GT_QTY_RE = re.compile(r"(\d+)\s*(?:no\.?|off|nr\.?)\s*(?:full\s+)?(?:(?:sets?|each|pairs?|panels?)\s*)*(?:required|req\b\.?|total)", re.I)
 GT_LIN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*linear\s*m", re.I)
 GT_FLAG_RE = re.compile(r"\b(ON HOLD|TBC|TO BE CONFIRMED|ARTWORK (?:REQUIRED|TBC|TO FOLLOW)|AWAITING|NOT REQUIRED|REMOVED|DELETED|OMITTED)\b", re.I)
-GT_LAYOUT_RE = re.compile(r"elevation|key plan|plan\b|^sign [a-z]$|manifestation|opening hours|legal signage|cover|index|contents", re.I)
+GT_LAYOUT_RE = re.compile(r"elevation|key plan|plan\b|^sign [a-z]$|manifestation|opening hours|legal signage|\bcover\b|index|contents", re.I)
 
 
 def read_manual_page(page, pno):
@@ -1753,7 +1753,8 @@ def read_manual_page(page, pno):
     body = [r for r in body if not r["t"].startswith("This drawing") and not r["t"].startswith("All measurements")]
     txt = " | ".join(r["t"] for r in sorted(body, key=lambda r: (round(r["y0"] / 6), r["x0"])))
     out["text"] = txt
-    for mm in GT_QTY_RE.finditer(txt):
+    qtxt = re.sub(r"\s*\|\s*(?:\.\s*)?", " ", txt)          # text runs split mid-sentence ("1 No | . required")
+    for mm in GT_QTY_RE.finditer(qtxt):
         out["qty"].append(int(mm.group(1)))
     out["lin"] = [float(x) for x in GT_LIN_RE.findall(txt)]
     out["flags"] = sorted({f.upper() for f in GT_FLAG_RE.findall(txt)})
@@ -1807,10 +1808,10 @@ def manual_signs(pages):
 _CK_STOP = set("a an the and or of to for in on at with by from is are be as no mm m x sign signs signage vinyl vinyls graphic graphics "
                "illuminated non wall mounted hanging fixed required req sets set each off new existing see refer artwork detail details "
                "applied internal internally external supply install fit fitted type size high wide long centres floor level ground first "
-               "one two three four five six tbc edit text message ref".split())
+               "one two three four five six tbc edit text message ref uk eu".split())
 _CK_SYN = {"toilets": "toilet", "wc": "toilet", "wcs": "toilet", "loo": "toilet", "bakers": "baker", "bakery": "baker", "baking": "bake",
            "tills": "till", "checkout": "till", "colleagues": "colleague", "customers": "customer", "doors": "door", "mirrors": "mirror",
-           "lifts": "lift", "slats": "slat", "totems": "totem", "directory": "directory", "directories": "directory", "boh": "boh",
+           "lifts": "lift", "slats": "slat", "totems": "directory", "totem": "directory", "directory": "directory", "directories": "directory", "boh": "boh",
            "backofhouse": "boh", "pay": "pay", "payment": "pay", "fitting": "fitting", "rooms": "room", "windows": "window",
            "letters": "letter", "lettering": "letter", "manifestations": "manifestation", "roundel": "roundel", "roundels": "roundel"}
 
@@ -1862,15 +1863,24 @@ def ck_score(sign, row, idf=None):
         return 0.0
     wt = (lambda w: idf.get(w, 1.0)) if idf else (lambda w: 1.0)
     shared = tt & rt
+    glued = re.sub(r"[^a-z0-9]", "", (sign["title"] or "").lower())    # titles with split letters ("W elcome", "Fr eestanding")
+    more = {w for w in rt if len(w) >= 4 and w in glued} - shared
+    if more:
+        shared = shared | more
+        tt = tt | more
     if not shared:
         return 0.0
+    if len(rt) <= 3 and sign.get("text") and rt <= (tt | ck_tokens(sign["text"])) and len(rt & tt) >= 1:
+        floor = 0.6                                   # short pack description entirely covered by the sheet's title + own text
+    else:
+        floor = 0.0
     base = sum(map(wt, shared)) / min(sum(map(wt, tt)), sum(map(wt, rt)))
     if base < 1.0 and sign.get("text"):
         bt = ck_tokens(sign["text"])
         extra = (rt - shared) & bt
         if extra:
             base = min(1.0, base + 0.1 * min(len(extra), 2))
-    return round(min(base, 1.0), 3)
+    return round(min(max(base, floor), 1.0), 3)
 
 
 def ck_match(signs, rows, thr=0.5):
@@ -1926,21 +1936,39 @@ def _ck_sizes(text):
     return {int(n) for n in re.findall(r"(?<![\d.])(\d{2,4})\s*mm", text or "", re.I)}
 
 
+TK_CODE_RE = re.compile(r"TK\d{2}-\d{1,3}[A-Z]{0,2}(?:-[A-Z]{1,2})?|TKM-\d+[A-Z]*")
+
+
+def _tk_base(c):
+    m = re.match(r"(TK\d{2}-\d{1,3}|TKM-\d+)", c.upper())
+    return m.group(1) if m else c.upper()
+
+
+def tk_code_ok(pack_code, manual_code):
+    """Same item: manual sheets write 'TK04-56A' where the pack writes 'TK04-56-A' (and may drop the colour suffix)."""
+    return _tk_base(pack_code) == _tk_base(manual_code)
+
+
 def ck_check(signs, rows, retailer):
     """Check each manual sign against the pack rows. Returns (checks, sign_summaries, pack_only)."""
     live = [r for r in rows if r.get("qty", 0) > 0]
     got, left = {i: [] for i in range(len(signs))}, []
     idf = ck_idf(signs, live)
-    for r in live:
-        hit = None
-        if retailer == "TK Maxx" and r["code"]:
-            cre = re.compile(r"(?<![A-Z0-9_-])" + re.escape(r["code"]) + r"(?![A-Z0-9_-])", re.I)
-            hit = [i for i, s in enumerate(signs) if cre.search(s["title"] + " " + s["text"])]
-        if hit:
+    tk = retailer == "TK Maxx"
+    sign_codes = [set(TK_CODE_RE.findall((x["title"] + " " + x["text"]).upper())) for x in signs] if tk else [set()] * len(signs)
+    by_code = set()
+    if tk:                                                     # pass 1: TK codes written on the manual sheets
+        for r in live:
+            hit = [i for i, cs in enumerate(sign_codes) if r["code"] and any(tk_code_ok(r["code"].upper(), m) for m in cs)]
             for i in hit:
                 got[i].append((r, 1.0))
+            if hit:
+                by_code.add(id(r))
+    code_found = [any(any(tk_code_ok(r["code"].upper(), m) for m in cs) for r in live) for cs in sign_codes]
+    for r in live:                                             # pass 2: by name, for what the codes didn't settle
+        if id(r) in by_code:
             continue
-        sc = [(ck_score(s, r, idf), i) for i, s in enumerate(signs)]
+        sc = [(ck_score(s, r, idf), i) for i, s in enumerate(signs) if not (tk and sign_codes[i] and code_found[i])]
         best = max(sc, default=(0, -1))
         if best[0] >= 0.5:
             for v, i in sc:
@@ -1972,14 +2000,14 @@ def ck_check(signs, rows, retailer):
             if conf < 0.7:
                 mq, psz_skip = [], True
             if mq:
-                ok = pq in mq or pq == sum(mq) or pq == sum(sorted(set(mq)))
+                ok = pq in mq or pq == sum(mq) or pq == sum(sorted(set(mq))) or any(pq == q * len(pk) for q in mq)
                 rows_out.append({**base, "Check": "Quantity", "Manual says": " / ".join(f"{q} No." for q in mq), "Pack says": str(pq),
                                  "Pack page": ppg, "Status": "OK" if ok else "Check",
                                  "Note": "" if ok else "Quantities differ - check the sheet and the pack callouts"})
             elif s["lin"] and conf >= 0.7:
                 rows_out.append({**base, "Check": "Quantity", "Manual says": " / ".join(f"{q:g} linear m" for q in s["lin"]),
                                  "Pack says": str(pq) + " callout(s)", "Pack page": ppg, "Status": "OK", "Note": "Measured in linear metres - not compared"})
-            psz = sorted({n for r in pk for n in _ck_sizes((r["size_name"] or "") + " " + r["desc"])})
+            psz = sorted({n for r in pk for n in _ck_sizes(("" if "(name)" in (r["size_name"] or "") else (r["size_name"] or "")) + " " + r["desc"])})
             if psz and conf >= 0.7:
                 msz = set(s["nums"]) | _ck_sizes(s["text"])
                 miss = [n for n in psz if n not in msz]
@@ -1995,6 +2023,16 @@ def ck_check(signs, rows, retailer):
             if fl:
                 rows_out.append({**base, "Check": "Pack flags", "Manual says": "", "Pack says": "; ".join(fl), "Pack page": ppg,
                                  "Status": "Check", "Note": "The pack itself flags this sign as unsettled or non-standard"})
+        if tk and sign_codes[i]:
+            absent = sorted(m for m in sign_codes[i] if not any(tk_code_ok(r["code"].upper(), m) for r in live))
+            if absent:
+                alt = [r for r in live if ck_score(s, r, idf) >= 0.6]
+                fam = {m[:4] for m in absent}
+                alt = alt or [r for r in left if r["code"][:4].upper() in fam]
+                hint = ("; the pack lists a similar sign as " + ", ".join(sorted({r["code"] for r in alt})[:3])) if alt else ""
+                rows_out.append({**base, "Check": "TK code", "Manual says": ", ".join(sorted(sign_codes[i])),
+                                 "Pack says": "not in the schedule: " + ", ".join(absent) + hint, "Pack page": ppg, "Status": "Check",
+                                 "Note": "Code on your sheet is not in the pack's schedule"})
         if s["flags"]:
             rows_out.append({**base, "Check": "Manual notes", "Manual says": ", ".join(s["flags"]), "Pack says": "", "Pack page": "",
                              "Status": "Check", "Note": "Your sheet carries a hold / TBC note"})
