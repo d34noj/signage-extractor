@@ -1,7 +1,7 @@
 """
 Store Signage Schedule Extractor
 --------------------------------
-Run:   streamlit run app.py
+Run:   streamlit run app_updated.py
 Needs: pip install streamlit pdfplumber pypdfium2 pandas openpyxl pillow reportlab anthropic
 """
 import base64
